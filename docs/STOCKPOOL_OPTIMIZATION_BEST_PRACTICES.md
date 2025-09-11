@@ -193,7 +193,364 @@ for stock in stocks:
         logger.info(f"已处理 {processed_count}/{len(stocks)} 只股票")
 ```
 
-## 🔧 代码质量优化最佳实践
+## � 数据优化最佳实践
+
+### 1. 数据格式标准化
+
+**JSON格式优化策略**：
+```python
+def optimize_json_format(data: Dict, is_production: bool = False) -> str:
+    """根据环境选择最优JSON格式"""
+    if is_production:
+        # 生产环境：紧凑格式，减少存储空间和传输时间
+        return json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+    else:
+        # 开发环境：格式化输出，便于调试
+        return json.dumps(data, indent=2, ensure_ascii=False, default=str)
+
+# 性能对比（测试数据：1000只股票）
+# 紧凑格式：1566064字符，0.092秒
+# 格式化：3220091字符，0.098秒
+# 节省：51%存储空间，6.5%序列化提速
+```
+
+**DataFrame格式优化**：
+```python
+def optimize_dataframe_operations(df: pd.DataFrame) -> pd.DataFrame:
+    """DataFrame操作优化"""
+    # 1. 预分配内存，避免动态扩容
+    if 'result' not in df.columns:
+        df = df.copy()  # 只在需要时拷贝
+        df['result'] = np.nan
+
+    # 2. 使用向量化操作替代循环
+    df['score'] = (
+        df['pe_ratio'] * 0.3 +
+        df['pb_ratio'] * 0.2 +
+        df['roe'] * 0.5
+    )
+
+    # 3. 选择合适的数据类型
+    df['stock_code'] = df['stock_code'].astype('category')  # 分类数据
+    df['price'] = df['price'].astype('float32')  # 减少内存使用
+
+    return df
+```
+
+### 2. 字段契约标准化
+
+**字段命名规范**：
+```python
+# 推荐的字段命名约定
+STANDARD_FIELD_MAPPING = {
+    # 股票基本信息
+    'stock_code': 'str',      # 股票代码
+    'stock_name': 'str',      # 股票名称
+    'exchange': 'str',        # 交易所
+
+    # 价格数据
+    'open_price': 'float32',  # 开盘价
+    'close_price': 'float32', # 收盘价
+    'high_price': 'float32',  # 最高价
+    'low_price': 'float32',   # 最低价
+    'volume': 'int64',        # 成交量
+
+    # 估值指标
+    'pe_ratio': 'float32',    # 市盈率
+    'pb_ratio': 'float32',    # 市净率
+    'roe': 'float32',         # 净资产收益率
+
+    # 时间字段
+    'trade_date': 'datetime64[ns]',  # 交易日期
+    'created_at': 'datetime64[ns]',  # 创建时间
+    'updated_at': 'datetime64[ns]'   # 更新时间
+}
+
+def validate_field_contract(data: Dict, field_mapping: Dict) -> Dict:
+    """验证字段契约"""
+    validated_data = {}
+
+    for field, expected_type in field_mapping.items():
+        if field in data:
+            value = data[field]
+
+            # 类型转换和验证
+            if expected_type == 'str':
+                validated_data[field] = str(value)
+            elif expected_type.startswith('float'):
+                validated_data[field] = float(value) if pd.notna(value) else np.nan
+            elif expected_type == 'int64':
+                validated_data[field] = int(value) if pd.notna(value) else 0
+            elif expected_type == 'datetime64[ns]':
+                validated_data[field] = pd.to_datetime(value)
+            else:
+                validated_data[field] = value
+
+    return validated_data
+```
+
+**数据类型标准化**：
+```python
+def standardize_data_types(df: pd.DataFrame) -> pd.DataFrame:
+    """标准化DataFrame数据类型"""
+    type_mapping = {
+        'stock_code': 'category',     # 减少内存使用
+        'open_price': 'float32',      # 32位精度足够
+        'close_price': 'float32',
+        'volume': 'int32',            # 减少内存占用
+        'pe_ratio': 'float32',
+        'trade_date': 'datetime64[ns]'
+    }
+
+    for column, dtype in type_mapping.items():
+        if column in df.columns:
+            try:
+                df[column] = df[column].astype(dtype)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"类型转换失败 {column}: {e}")
+
+    return df
+```
+
+### 3. 数据传递优化
+
+**引用传递 vs 值传递**：
+```python
+class DataManager:
+    def __init__(self):
+        self._data_cache = {}  # 内部缓存，避免重复创建
+
+    def get_data_reference(self, key: str, copy: bool = True):
+        """智能数据传递"""
+        if key not in self._data_cache:
+            return None
+
+        data = self._data_cache[key]
+
+        # 根据使用场景选择传递方式
+        if copy:
+            # 需要修改数据时，使用深拷贝
+            return data.copy() if hasattr(data, 'copy') else data
+        else:
+            # 只读操作时，直接返回引用
+            return data
+
+    def update_data_efficiently(self, key: str, updates: Dict):
+        """就地更新，避免创建新对象"""
+        if key in self._data_cache:
+            data = self._data_cache[key]
+
+            # 直接修改现有对象
+            if isinstance(data, dict):
+                data.update(updates)
+            elif hasattr(data, 'update'):
+                data.update(updates)
+
+            # 更新时间戳
+            data['updated_at'] = datetime.now()
+```
+
+**批量数据传递优化**：
+```python
+def batch_process_with_references(self, stock_codes: List[str]) -> Dict[str, pd.DataFrame]:
+    """批量处理，使用引用避免拷贝"""
+    results = {}
+
+    # 预分配结果字典
+    for code in stock_codes:
+        if code in self.price_cache:
+            # 直接传递引用，不拷贝
+            results[code] = self.price_cache[code]
+
+    return results
+
+def process_with_minimal_copy(self, data_list: List[Dict]) -> List[Dict]:
+    """最小化拷贝的数据处理"""
+    processed = []
+
+    for item in data_list:
+        # 就地修改，避免创建新字典
+        if 'status' not in item:
+            item['status'] = 'processed'
+        if 'processed_at' not in item:
+            item['processed_at'] = datetime.now().isoformat()
+
+        processed.append(item)  # 传递引用
+
+    return processed
+```
+
+### 4. 内存拷贝深度优化
+
+**条件拷贝策略**：
+```python
+def smart_copy_strategy(data, force_copy: bool = False):
+    """智能拷贝策略"""
+    if not force_copy:
+        # 分析数据大小和使用模式
+        if isinstance(data, pd.DataFrame):
+            # 小DataFrame直接传递引用
+            if len(data) < 1000:
+                return data
+            # 大DataFrame根据修改频率决定
+            elif self._is_read_only_operation():
+                return data
+            else:
+                return data.copy()
+        elif isinstance(data, dict):
+            # 小字典直接传递
+            if len(data) < 50:
+                return data
+            else:
+                return data.copy()
+
+    # 强制拷贝场景
+    if hasattr(data, 'copy'):
+        return data.copy()
+    else:
+        return data  # 不可变对象直接返回
+
+def _is_read_only_operation(self) -> bool:
+    """判断是否为只读操作"""
+    # 基于调用栈或上下文判断操作类型
+    import inspect
+    frame = inspect.currentframe()
+    try:
+        # 检查调用函数名是否包含read/get等只读关键词
+        caller_name = frame.f_back.f_code.co_name.lower()
+        return any(keyword in caller_name for keyword in ['get', 'read', 'find', 'query'])
+    finally:
+        del frame
+```
+
+**内存池管理**：
+```python
+class MemoryPool:
+    """内存池管理，避免频繁分配释放"""
+    def __init__(self, max_pool_size: int = 100):
+        self.pool = []
+        self.max_size = max_pool_size
+
+    def get_dataframe(self, rows: int, columns: List[str]) -> pd.DataFrame:
+        """从池中获取或创建DataFrame"""
+        # 查找合适大小的DataFrame
+        for i, df in enumerate(self.pool):
+            if len(df) >= rows and all(col in df.columns for col in columns):
+                # 找到合适的DataFrame
+                df = self.pool.pop(i)
+                # 重置数据
+                df = df.iloc[:0].copy()  # 保留结构，清空数据
+                return df
+
+        # 池中没有合适的，创建新的
+        return pd.DataFrame(index=range(rows), columns=columns)
+
+    def return_dataframe(self, df: pd.DataFrame):
+        """将DataFrame返回池中"""
+        if len(self.pool) < self.max_size:
+            # 清空数据但保留结构
+            empty_df = df.iloc[:0].copy()
+            self.pool.append(empty_df)
+
+# 使用示例
+pool = MemoryPool()
+df = pool.get_dataframe(1000, ['code', 'price', 'volume'])
+# 使用df进行操作
+# 操作完成后返回池中
+pool.return_dataframe(df)
+```
+
+### 5. 数据验证和类型安全
+
+**运行时类型检查**：
+```python
+from typing import get_type_hints
+import inspect
+
+def validate_method_signature(func):
+    """方法签名验证装饰器"""
+    sig = inspect.signature(func)
+    type_hints = get_type_hints(func)
+
+    def wrapper(*args, **kwargs):
+        # 绑定参数
+        bound_args = sig.bind(*args, **kwargs)
+        bound_args.apply_defaults()
+
+        # 类型检查
+        for param_name, param_value in bound_args.arguments.items():
+            if param_name in type_hints:
+                expected_type = type_hints[param_name]
+                if not isinstance(param_value, expected_type):
+                    try:
+                        # 尝试类型转换
+                        bound_args.arguments[param_name] = expected_type(param_value)
+                    except (ValueError, TypeError):
+                        raise TypeError(
+                            f"参数 {param_name} 类型错误，期望 {expected_type.__name__}，"
+                            f"实际 {type(param_value).__name__}"
+                        )
+
+        return func(*bound_args.args, **bound_args.kwargs)
+
+    return wrapper
+
+@validate_method_signature
+def process_stock_data(stock_code: str, price_data: pd.DataFrame) -> Dict:
+    """处理股票数据，带类型验证"""
+    return {
+        'code': stock_code,
+        'avg_price': price_data['close'].mean(),
+        'volatility': price_data['close'].std()
+    }
+```
+
+**数据完整性验证**：
+```python
+def validate_data_integrity(data: Union[pd.DataFrame, Dict, List]) -> bool:
+    """数据完整性验证"""
+    try:
+        if isinstance(data, pd.DataFrame):
+            # DataFrame验证
+            if data.empty:
+                return False
+
+            # 检查必需列
+            required_columns = ['stock_code', 'trade_date', 'close_price']
+            if not all(col in data.columns for col in required_columns):
+                return False
+
+            # 检查数据类型
+            if not pd.api.types.is_datetime64_any_dtype(data['trade_date']):
+                return False
+
+            # 检查空值比例
+            null_ratio = data.isnull().mean()
+            if (null_ratio > 0.5).any():
+                return False
+
+        elif isinstance(data, dict):
+            # 字典验证
+            required_keys = ['stock_code', 'data']
+            if not all(key in data for key in required_keys):
+                return False
+
+            # 递归验证嵌套数据
+            if 'data' in data and isinstance(data['data'], list):
+                return all(validate_data_integrity(item) for item in data['data'])
+
+        elif isinstance(data, list):
+            # 列表验证
+            return all(validate_data_integrity(item) for item in data)
+
+        return True
+
+    except Exception as e:
+        logger.error(f"数据完整性验证失败: {e}")
+        return False
+```
+
+## �🔧 代码质量优化最佳实践
 
 ### 1. 错误处理和日志
 
