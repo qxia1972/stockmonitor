@@ -44,56 +44,31 @@ Thumbs.db
 # Data files - 程序生成的数据文件
 stockpool_data/
 data/
-*.json
-!config/*.json  # 但保留配置文件中的JSON
-
-# Logs and temp files
+cache/
 logs/
 temp/
 backup/
 *.log
 *.tmp
 *.bak
-*~
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Test results
-test/reflection_reports/
-test/validation_results.json
-
-# Stock data - 股票数据文件（程序生成）
-stockpool_data/
-data/
-cache/
-*.json
-!*.py  # 但保留Python文件
-
-# Backup files
-*.bak
 *.backup
 *~
 
-# Temporary files
-*.tmp
-*.temp
-
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Test results
-test/reflection_reports/
-test/validation_results.json
+# JSON files - 排除所有，但保留特定配置文件
 *.json
+!config/pyrightconfig.json
+!config/*.json  # 保留config目录下的所有JSON文件
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Backup files - 排除所有，但保留特定备份
+*.backup
+!modules/data_manager.py.backup  # 保留数据管理器备份
 
-# Temporary files
-*.tmp
-*.bak
-*~
+# Test directories (if they exist)
+test/
+tools/
 
-# Backup directories
-backup/
+# Other temporary files
+*.temp
