@@ -12,8 +12,7 @@
 ```
 stockman/
 ├── stockpool.py              # 🚀 主程序文件
-├── stockmonitor.py           # 📊 股票监控模块
-├── stockmonitor_tool.py      # ��️ 监控工具
+├── stockmonitor.py           # 📊 股票监控模块 (支持命令行工具)
 ├── __init__.py              # 📦 包初始化
 │
 ├── modules/                  # 📚 核心模块
@@ -119,7 +118,31 @@ python stockpool.py --help
 python scripts/start_system.py
 ```
 
-### 3. 开发工具使用
+### 3. 股票监控工具
+```bash
+# 启动GUI监控界面（默认）
+python stockmonitor.py
+
+# 查看监控程序状态
+python stockmonitor.py status
+
+# 实时监控内存使用
+python stockmonitor.py monitor
+
+# 分析程序运行状态
+python stockmonitor.py analyze
+
+# 性能分析（60秒）
+python stockmonitor.py profile
+
+# 终止监控程序
+python stockmonitor.py kill
+
+# 查看帮助信息
+python stockmonitor.py --help
+```
+
+### 4. 开发工具使用
 ```bash
 # 安全编辑（自动备份）
 python tools/safe_edit.py stockpool.py
