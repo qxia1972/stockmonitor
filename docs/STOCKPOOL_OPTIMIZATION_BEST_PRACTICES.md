@@ -217,87 +217,205 @@ def optimize_json_format(data: Dict, is_production: bool = False) -> str:
 **DataFrame格式优化**：
 ```python
 def optimize_dataframe_operations(df: pd.DataFrame) -> pd.DataFrame:
-    """DataFrame操作优化"""
+    """DataFrame操作优化（使用RQDatac标准字段）"""
     # 1. 预分配内存，避免动态扩容
-    if 'result' not in df.columns:
+    if 'score' not in df.columns:
         df = df.copy()  # 只在需要时拷贝
-        df['result'] = np.nan
+        df['score'] = np.nan
 
-    # 2. 使用向量化操作替代循环
+    # 2. 使用向量化操作替代循环（RQDatac字段名）
     df['score'] = (
         df['pe_ratio'] * 0.3 +
         df['pb_ratio'] * 0.2 +
         df['roe'] * 0.5
     )
 
-    # 3. 选择合适的数据类型
-    df['stock_code'] = df['stock_code'].astype('category')  # 分类数据
-    df['price'] = df['price'].astype('float32')  # 减少内存使用
+    # 3. 选择合适的数据类型（RQDatac标准）
+    df['order_book_id'] = df['order_book_id'].astype('category')  # 股票代码分类
+    df['symbol'] = df['symbol'].astype('category')               # 股票名称分类
+    df['open'] = df['open'].astype('float32')                    # 开盘价
+    df['close'] = df['close'].astype('float32')                  # 收盘价
+    df['volume'] = df['volume'].astype('int64')                  # 成交量
+    df['date'] = pd.to_datetime(df['date'])                      # 交易日期
 
     return df
 ```
 
 ### 2. 字段契约标准化
 
-**字段命名规范**：
+**与RQDatac一致的字段命名规范**：
 ```python
-# 推荐的字段命名约定
-STANDARD_FIELD_MAPPING = {
-    # 股票基本信息
-    'stock_code': 'str',      # 股票代码
-    'stock_name': 'str',      # 股票名称
-    'exchange': 'str',        # 交易所
+# RQDatac标准字段映射
+RQDATAC_FIELD_MAPPING = {
+    # 股票标识 (RQDatac标准)
+    'order_book_id': 'str',        # 股票代码 (RQDatac标准字段)
+    'symbol': 'str',               # 股票简称
+    'display_name': 'str',         # 显示名称
 
-    # 价格数据
-    'open_price': 'float32',  # 开盘价
-    'close_price': 'float32', # 收盘价
-    'high_price': 'float32',  # 最高价
-    'low_price': 'float32',   # 最低价
-    'volume': 'int64',        # 成交量
+    # 价格数据 (RQDatac标准)
+    'open': 'float32',             # 开盘价
+    'close': 'float32',            # 收盘价
+    'high': 'float32',             # 最高价
+    'low': 'float32',              # 最低价
+    'volume': 'int64',             # 成交量
+    'total_turnover': 'float64',   # 成交额
 
-    # 估值指标
-    'pe_ratio': 'float32',    # 市盈率
-    'pb_ratio': 'float32',    # 市净率
-    'roe': 'float32',         # 净资产收益率
+    # 日期时间 (RQDatac标准)
+    'date': 'datetime64[ns]',      # 交易日期
 
-    # 时间字段
-    'trade_date': 'datetime64[ns]',  # 交易日期
-    'created_at': 'datetime64[ns]',  # 创建时间
-    'updated_at': 'datetime64[ns]'   # 更新时间
+    # 估值指标 (RQDatac标准)
+    'pe_ratio': 'float32',         # 市盈率
+    'pb_ratio': 'float32',         # 市净率
+    'market_cap': 'float64',       # 总市值
+    'circulation_market_cap': 'float64',  # 流通市值
+
+    # 财务指标
+    'roe': 'float32',              # 净资产收益率
+    'roa': 'float32',              # 总资产收益率
+    'gross_profit_margin': 'float32',  # 毛利率
+    'net_profit_margin': 'float32',    # 净利率
+
+    # 技术指标 (TA-Lib计算结果)
+    'sma_5': 'float32',            # 5日简单移动平均
+    'sma_20': 'float32',           # 20日简单移动平均
+    'rsi_14': 'float32',           # 14日RSI指标
+    'macd': 'float32',             # MACD指标
+    'macd_signal': 'float32',      # MACD信号线
+    'macd_hist': 'float32',        # MACD柱状图
+
+    # 系统字段
+    'created_at': 'datetime64[ns]', # 创建时间
+    'updated_at': 'datetime64[ns]', # 更新时间
+    'data_source': 'str'           # 数据来源
 }
 
-def validate_field_contract(data: Dict, field_mapping: Dict) -> Dict:
-    """验证字段契约"""
+# 字段别名映射 (兼容不同数据源)
+FIELD_ALIASES = {
+    # 股票代码别名
+    'order_book_id': ['stock_code', 'code', 'symbol'],
+    'symbol': ['stock_name', 'name', 'display_name'],
+
+    # 价格数据别名
+    'open': ['open_price', 'opening_price'],
+    'close': ['close_price', 'closing_price'],
+    'high': ['high_price', 'highest_price'],
+    'low': ['low_price', 'lowest_price'],
+    'volume': ['vol', 'turnover_vol'],
+    'total_turnover': ['amount', 'turnover'],
+
+    # 日期别名
+    'date': ['trade_date', 'trading_date', 'datetime'],
+
+    # 估值指标别名
+    'pe_ratio': ['pe', 'price_earnings_ratio'],
+    'pb_ratio': ['pb', 'price_book_ratio'],
+    'market_cap': ['total_market_cap', 'market_value']
+}
+
+def validate_field_contract(data: Dict, field_mapping: Dict = None) -> Dict:
+    """验证字段契约，支持字段别名映射"""
+    if field_mapping is None:
+        field_mapping = RQDATAC_FIELD_MAPPING
+
     validated_data = {}
 
     for field, expected_type in field_mapping.items():
+        value = None
+
+        # 首先检查标准字段名
         if field in data:
             value = data[field]
+        else:
+            # 检查字段别名
+            if field in FIELD_ALIASES:
+                for alias in FIELD_ALIASES[field]:
+                    if alias in data:
+                        value = data[alias]
+                        break
 
+        if value is not None:
             # 类型转换和验证
-            if expected_type == 'str':
-                validated_data[field] = str(value)
-            elif expected_type.startswith('float'):
-                validated_data[field] = float(value) if pd.notna(value) else np.nan
-            elif expected_type == 'int64':
-                validated_data[field] = int(value) if pd.notna(value) else 0
-            elif expected_type == 'datetime64[ns]':
-                validated_data[field] = pd.to_datetime(value)
-            else:
-                validated_data[field] = value
+            try:
+                if expected_type == 'str':
+                    validated_data[field] = str(value)
+                elif expected_type.startswith('float'):
+                    validated_data[field] = float(value) if pd.notna(value) else np.nan
+                elif expected_type.startswith('int'):
+                    validated_data[field] = int(value) if pd.notna(value) else 0
+                elif expected_type == 'datetime64[ns]':
+                    validated_data[field] = pd.to_datetime(value)
+                else:
+                    validated_data[field] = value
+            except (ValueError, TypeError) as e:
+                logger.warning(f"字段 {field} 类型转换失败: {e}, 值: {value}")
+                validated_data[field] = None
 
     return validated_data
+
+def normalize_rqdatac_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """标准化DataFrame字段名为RQDatac规范"""
+    # 字段重命名映射
+    rename_mapping = {
+        'stock_code': 'order_book_id',
+        'stock_name': 'symbol',
+        'open_price': 'open',
+        'close_price': 'close',
+        'high_price': 'high',
+        'low_price': 'low',
+        'trade_date': 'date',
+        'pe': 'pe_ratio',
+        'pb': 'pb_ratio'
+    }
+
+    # 只重命名存在的列
+    existing_renames = {old: new for old, new in rename_mapping.items()
+                       if old in df.columns and new not in df.columns}
+
+    if existing_renames:
+        df = df.rename(columns=existing_renames)
+        logger.info(f"字段重命名完成: {existing_renames}")
+
+    return df
 ```
 
 **数据类型标准化**：
 ```python
 def standardize_data_types(df: pd.DataFrame) -> pd.DataFrame:
-    """标准化DataFrame数据类型"""
+    """标准化DataFrame数据类型（RQDatac兼容）"""
     type_mapping = {
-        'stock_code': 'category',     # 减少内存使用
-        'open_price': 'float32',      # 32位精度足够
-        'close_price': 'float32',
-        'volume': 'int32',            # 减少内存占用
+        # RQDatac标准字段类型
+        'order_book_id': 'category',    # 股票代码作为分类数据
+        'symbol': 'category',           # 股票名称作为分类数据
+        'open': 'float32',              # 价格数据用32位浮点
+        'close': 'float32',
+        'high': 'float32',
+        'low': 'float32',
+        'volume': 'int64',              # 成交量用64位整数
+        'total_turnover': 'float64',    # 成交额用64位浮点
+        'date': 'datetime64[ns]',       # 日期用纳秒精度
+        'pe_ratio': 'float32',
+        'pb_ratio': 'float32',
+        'market_cap': 'float64',
+        'roe': 'float32',
+        'rsi_14': 'float32',
+        'macd': 'float32'
+    }
+
+    for column, dtype in type_mapping.items():
+        if column in df.columns:
+            try:
+                if dtype == 'category':
+                    df[column] = df[column].astype('category')
+                elif dtype.startswith('float'):
+                    df[column] = pd.to_numeric(df[column], errors='coerce').astype(dtype)
+                elif dtype.startswith('int'):
+                    df[column] = pd.to_numeric(df[column], errors='coerce').astype(dtype)
+                elif dtype == 'datetime64[ns]':
+                    df[column] = pd.to_datetime(df[column], errors='coerce')
+            except (ValueError, TypeError) as e:
+                logger.warning(f"类型转换失败 {column}: {e}")
+
+    return df
         'pe_ratio': 'float32',
         'trade_date': 'datetime64[ns]'
     }
@@ -454,7 +572,7 @@ class MemoryPool:
 
 # 使用示例
 pool = MemoryPool()
-df = pool.get_dataframe(1000, ['code', 'price', 'volume'])
+df = pool.get_dataframe(1000, ['order_book_id', 'open', 'close', 'volume', 'date'])
 # 使用df进行操作
 # 操作完成后返回池中
 pool.return_dataframe(df)
@@ -496,32 +614,33 @@ def validate_method_signature(func):
     return wrapper
 
 @validate_method_signature
-def process_stock_data(stock_code: str, price_data: pd.DataFrame) -> Dict:
-    """处理股票数据，带类型验证"""
+def process_stock_data(order_book_id: str, price_data: pd.DataFrame) -> Dict:
+    """处理股票数据，带类型验证（使用RQDatac字段名）"""
     return {
-        'code': stock_code,
+        'order_book_id': order_book_id,
         'avg_price': price_data['close'].mean(),
-        'volatility': price_data['close'].std()
+        'volatility': price_data['close'].std(),
+        'data_points': len(price_data)
     }
 ```
 
 **数据完整性验证**：
 ```python
 def validate_data_integrity(data: Union[pd.DataFrame, Dict, List]) -> bool:
-    """数据完整性验证"""
+    """数据完整性验证（RQDatac字段规范）"""
     try:
         if isinstance(data, pd.DataFrame):
             # DataFrame验证
             if data.empty:
                 return False
 
-            # 检查必需列
-            required_columns = ['stock_code', 'trade_date', 'close_price']
+            # 检查必需列（RQDatac标准字段）
+            required_columns = ['order_book_id', 'date', 'close']
             if not all(col in data.columns for col in required_columns):
                 return False
 
             # 检查数据类型
-            if not pd.api.types.is_datetime64_any_dtype(data['trade_date']):
+            if not pd.api.types.is_datetime64_any_dtype(data['date']):
                 return False
 
             # 检查空值比例
@@ -530,8 +649,8 @@ def validate_data_integrity(data: Union[pd.DataFrame, Dict, List]) -> bool:
                 return False
 
         elif isinstance(data, dict):
-            # 字典验证
-            required_keys = ['stock_code', 'data']
+            # 字典验证（使用RQDatac字段）
+            required_keys = ['order_book_id', 'data']
             if not all(key in data for key in required_keys):
                 return False
 
