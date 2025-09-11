@@ -1,0 +1,52 @@
+import pandas as pd
+import numpy as np
+import sys
+sys.path.append('modules')
+
+print('🚀 OHLCV DataFrame API 演示')
+print('=' * 40)
+
+# 创建示例数据
+data = {
+    'open': [100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
+    'high': [102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
+    'low': [99, 100, 101, 102, 103, 104, 105, 106, 107, 108],
+    'close': [101, 102, 103, 104, 105, 106, 107, 108, 109, 110],
+    'volume': [1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900]
+}
+df = pd.DataFrame(data)
+
+print('数据预览:')
+print(df.head())
+print()
+
+from modules.indicator_manager import calculate_sma, calculate_ema, calculate_stochastic
+
+print('✅ 新API使用示例:')
+print()
+
+# 单价格指标 - 简洁调用
+sma = calculate_sma(df, 5)  # 默认使用close列
+ema = calculate_ema(df, 5)
+print(f'SMA(5): {sma.iloc[-1]:.2f}')
+print(f'EMA(5): {ema.iloc[-1]:.2f}')
+print()
+
+# 多价格指标 - 一个DataFrame搞定
+stoch = calculate_stochastic(df, k_period=5, d_period=3)
+print(f'Stochastic K: {stoch["stoch_k"].iloc[-1]:.2f}')
+print(f'Stochastic D: {stoch["stoch_d"].iloc[-1]:.2f}')
+print()
+
+# 指定不同价格列
+sma_open = calculate_sma(df, 5, price_column='open')
+print(f'SMA(open, 5): {sma_open.iloc[-1]:.2f}')
+print()
+
+print('🎯 对比传统方式的优势:')
+print('  传统: calculate_sma(df["close"], 5)')
+print('  新式: calculate_sma(df, 5)')
+print('  传统: calculate_stochastic(df["high"], df["low"], df["close"])')
+print('  新式: calculate_stochastic(df)')
+print()
+print('✨ 代码更简洁，更少出错，更易维护！')
