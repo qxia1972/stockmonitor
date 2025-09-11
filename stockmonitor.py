@@ -29,26 +29,358 @@ import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
 from typing import Dict, List, Optional, Protocol, Set
-from abc import ABC, abstractmethod
+import argparse
+import psutil
+import time
+import threading
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle
 
 # Import simplified data interface modules
 from modules.data_interface import (
-    get_stock_kline, calculate_basic_indicators,
-    preload_indicators, get_cache_stats, log_memory_usage
+    get_stock_kline, calculate_basic_indicators
 )
 
-# Configure matplotlib for Chinese font display
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
+# Import logger
+from modules.log_manager import get_monitor_logger
+
+# Initialize monitor logger
+logger = get_monitor_logger()
+
+
+# ========================================================
+#               Stock Monitor Tool Class
+# ========================================================
+
+class StockMonitorTool:
+    """
+    Stock monitor program management and monitoring tool
+
+    Provides comprehensive monitoring capabilities for stockmonitor.py processes
+    including resource tracking, performance analysis and process management.
+    """
+
+    def __init__(self):
+        self.target_process_name = "python"
+        self.memory_data = []
+        self.time_data = []
+        self.is_monitoring = False
+
+    def find_stockmonitor_process(self):
+        """
+        Find running stockmonitor.py process
+
+        Searches through all running Python processes to locate
+        stockmonitor.py instances.
+
+        Returns:
+            psutil.Process: Process object if found, None otherwise
+        """
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+            try:
+                cmdline = proc.info['cmdline']
+                if cmdline and any('stockmonitor.py' in cmd for cmd in cmdline):
+                    return proc
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return None
+
+    def get_process_info(self):
+        """
+        Get detailed process information
+
+        Retrieves comprehensive information about the stockmonitor process
+        including PID, status, resource usage and system metrics.
+
+        Returns:
+            dict: Process information dictionary or None if not found
+        """
+        process = self.find_stockmonitor_process()
+        if not process:
+            return None
+
+        try:
+            info = {
+                'pid': process.pid,
+                'name': process.name(),
+                'status': process.status(),
+                'create_time': datetime.fromtimestamp(process.create_time()).strftime('%Y-%m-%d %H:%M:%S'),
+                'cpu_percent': process.cpu_percent(),
+                'memory_percent': process.memory_percent(),
+                'memory_info': process.memory_info(),
+                'num_threads': process.num_threads(),
+                'connections': len(process.connections()) if hasattr(process, 'connections') else 0
+            }
+            return info
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return None
+
+
+def show_status():
+    """显示股票监控程序状态"""
+    logger.info("=" * 60)
+    logger.info("股票监控程序状态")
+    logger.info("=" * 60)
+
+    tool = StockMonitorTool()
+    process_info = tool.get_process_info()
+
+    if not process_info:
+        logger.warning("✗ 未找到正在运行的stockmonitor.py程序")
+        logger.info("启动建议:")
+        logger.info("  1. 运行命令: python stockmonitor.py")
+        logger.info("  2. 或使用: python stockmonitor.py --monitor")
+        return
+
+    logger.info("程序信息:")
+    logger.info(f"  进程ID: {process_info['pid']}")
+    logger.info(f"  程序状态: {process_info['status']}")
+    logger.info(f"  启动时间: {process_info['create_time']}")
+    logger.info(f"  线程数: {process_info['num_threads']}")
+    logger.info(f"  网络连接: {process_info['connections']}")
+
+    logger.info("内存使用:")
+    memory_info = process_info['memory_info']
+    logger.info(f"  物理内存(RSS): {memory_info.rss / 1024 / 1024:.1f} MB")
+    logger.info(f"  虚拟内存(VMS): {memory_info.vms / 1024 / 1024:.1f} MB")
+    logger.info(f"  内存占用率: {process_info['memory_percent']:.1f}%")
+
+    logger.info("CPU使用:")
+    logger.info(f"  CPU占用率: {process_info['cpu_percent']:.1f}%")
+
+
+def monitor_memory():
+    """实时监控内存使用"""
+    logger.info("=" * 60)
+    logger.info("股票程序内存实时监控")
+    logger.info("=" * 60)
+
+    tool = StockMonitorTool()
+    process = tool.find_stockmonitor_process()
+
+    if not process:
+        logger.warning("✗ 未找到正在运行的stockmonitor.py程序")
+        return
+
+    logger.info(f"找到进程 PID: {process.pid}")
+    logger.info("按 Ctrl+C 停止监控")
+
+    try:
+        start_time = time.time()
+
+        logger.info(f"{'时间':>8} {'RSS(MB)':>10} {'VMS(MB)':>10} {'占用率%':>8} {'CPU%':>6} {'状态':>12}")
+        logger.info("-" * 70)
+
+        while True:
+            try:
+                memory_info = process.memory_info()
+                memory_percent = process.memory_percent()
+                cpu_percent = process.cpu_percent()
+                status = process.status()
+
+                elapsed = time.time() - start_time
+                rss_mb = memory_info.rss / 1024 / 1024
+                vms_mb = memory_info.vms / 1024 / 1024
+
+                logger.info(f"{elapsed:8.0f} {rss_mb:10.1f} {vms_mb:10.1f} {memory_percent:8.1f} {cpu_percent:6.1f} {status:>12}")
+
+                time.sleep(5)  # 每5秒更新一次
+
+            except psutil.NoSuchProcess:
+                logger.warning("进程已结束")
+                break
+            except KeyboardInterrupt:
+                logger.info("监控已停止")
+                break
+
+    except psutil.NoSuchProcess:
+        logger.error(f"进程不存在")
+    except Exception as e:
+        logger.error(f"监控过程中出错: {e}")
+
+
+def analyze_program():
+    """分析正在运行的程序"""
+    logger.info("=" * 60)
+    logger.info("股票程序运行分析")
+    logger.info("=" * 60)
+
+    tool = StockMonitorTool()
+    process = tool.find_stockmonitor_process()
+
+    if not process:
+        logger.warning("✗ 未找到正在运行的stockmonitor.py程序")
+        return
+
+    try:
+        # 基本信息
+        logger.info("基本信息:")
+        logger.info(f"  进程ID: {process.pid}")
+        logger.info(f"  进程名: {process.name()}")
+        logger.info(f"  状态: {process.status()}")
+        logger.info(f"  启动时间: {datetime.fromtimestamp(process.create_time()).strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # 资源使用
+        memory_info = process.memory_info()
+        logger.info("资源使用:")
+        logger.info(f"  物理内存(RSS): {memory_info.rss / 1024 / 1024:.1f} MB")
+        logger.info(f"  虚拟内存(VMS): {memory_info.vms / 1024 / 1024:.1f} MB")
+        logger.info(f"  内存占用率: {process.memory_percent():.1f}%")
+        logger.info(f"  CPU占用率: {process.cpu_percent():.1f}%")
+
+        # 线程信息
+        logger.info(f"线程信息:")
+        logger.info(f"  线程数: {process.num_threads()}")
+
+        # 文件句柄
+        try:
+            open_files = process.open_files()
+            logger.info(f"  打开文件数: {len(open_files)}")
+            if open_files:
+                logger.info("  主要文件:")
+                for f in open_files[:5]:  # 显示前5个文件
+                    logger.info(f"    {f.path}")
+        except psutil.AccessDenied:
+            logger.warning("  文件信息: 无权限访问")
+
+        # 网络连接
+        try:
+            connections = process.connections()
+            logger.info(f"  网络连接数: {len(connections)}")
+            if connections:
+                logger.info("  连接信息:")
+                for conn in connections[:3]:  # 显示前3个连接
+                    logger.info(f"    {conn.laddr} -> {conn.raddr if conn.raddr else 'N/A'} ({conn.status})")
+        except psutil.AccessDenied:
+            logger.warning("  网络信息: 无权限访问")
+
+        # 环境变量
+        try:
+            environ = process.environ()
+            logger.info(f"环境变量 (关键):")
+            key_vars = ['PYTHONPATH', 'PATH', 'CONDA_DEFAULT_ENV']
+            for var in key_vars:
+                if var in environ:
+                    value = environ[var]
+                    if len(value) > 60:
+                        value = value[:60] + "..."
+                    logger.info(f"  {var}: {value}")
+        except psutil.AccessDenied:
+            logger.warning("  环境变量: 无权限访问")
+
+    except psutil.NoSuchProcess:
+        logger.warning("进程已结束")
+    except Exception as e:
+        logger.error(f"分析过程中出错: {e}")
+
+
+def profile_memory():
+    """内存使用性能分析"""
+    logger.info("=" * 60)
+    logger.info("内存使用性能分析")
+    logger.info("=" * 60)
+
+    tool = StockMonitorTool()
+    process = tool.find_stockmonitor_process()
+
+    if not process:
+        logger.warning("✗ 未找到正在运行的stockmonitor.py程序")
+        return
+
+    logger.info(f"找到进程 PID: {process.pid}")
+    logger.info("开始性能分析，持续60秒...")
+
+    try:
+        # 收集数据
+        memory_data = []
+        cpu_data = []
+        time_data = []
+
+        start_time = time.time()
+        duration = 60  # 分析60秒
+        interval = 2   # 每2秒采样
+
+        while time.time() - start_time < duration:
+            try:
+                current_time = time.time() - start_time
+                memory_info = process.memory_info()
+                cpu_percent = process.cpu_percent()
+
+                memory_mb = memory_info.rss / 1024 / 1024
+
+                time_data.append(current_time)
+                memory_data.append(memory_mb)
+                cpu_data.append(cpu_percent)
+
+                logger.info(f"[{current_time:5.1f}s] 内存: {memory_mb:6.1f}MB, CPU: {cpu_percent:5.1f}%")
+
+                time.sleep(interval)
+
+            except psutil.NoSuchProcess:
+                logger.warning("进程已结束")
+                break
+
+        # 生成分析报告
+        if memory_data:
+            logger.info("分析报告:")
+            logger.info(f"  采样点数: {len(memory_data)}")
+            logger.info(f"  内存使用:")
+            logger.info(f"    平均值: {sum(memory_data)/len(memory_data):.1f} MB")
+            logger.info(f"    最大值: {max(memory_data):.1f} MB")
+            logger.info(f"    最小值: {min(memory_data):.1f} MB")
+            logger.info(f"    变化幅度: {max(memory_data) - min(memory_data):.1f} MB")
+
+            logger.info(f"  CPU使用:")
+            logger.info(f"    平均值: {sum(cpu_data)/len(cpu_data):.1f}%")
+            logger.info(f"    最大值: {max(cpu_data):.1f}%")
+
+    except Exception as e:
+        logger.error(f"性能分析失败: {e}")
+
+
+def kill_process():
+    """终止股票监控程序"""
+    logger.info("=" * 60)
+    logger.info("终止股票监控程序")
+    logger.info("=" * 60)
+
+    tool = StockMonitorTool()
+    process = tool.find_stockmonitor_process()
+
+    if not process:
+        logger.warning("✗ 未找到正在运行的stockmonitor.py程序")
+        return
+
+    try:
+        logger.info(f"找到进程 PID: {process.pid}")
+
+        # 确认操作
+        logger.warning("⚠️  警告: 这将强制终止股票监控程序")
+        confirm = input("确认执行? (y/N): ").strip().lower()
+
+        if confirm in ['y', 'yes']:
+            process.terminate()
+            logger.info("✓ 终止信号已发送")
+
+            # 等待进程结束
+            try:
+                process.wait(timeout=10)
+                logger.info("✓ 程序已正常终止")
+            except psutil.TimeoutExpired:
+                logger.warning("程序未响应，执行强制杀死...")
+                process.kill()
+                logger.info("✓ 程序已强制终止")
+        else:
+            logger.info("操作已取消")
+
+    except psutil.NoSuchProcess:
+        logger.warning("进程已结束")
+    except Exception as e:
+        logger.error(f"终止程序失败: {e}")
 
 
 # ========================================================
@@ -119,40 +451,76 @@ class StockMonitorModel:
             self._basic_stocks.clear()
             
             # 加载基础层股票
-            if pools and pools.get('basic_layer'):
-                for stock in pools['basic_layer']:
-                    stock_data = StockData(
-                        code=stock['stock_code'],
-                        name=stock.get('name', stock['stock_code']),
-                        price=stock.get('current_price', 0),
-                        market_cap=stock.get('market_cap', 0),
-                        score=stock['score']
-                    )
-                    self._basic_stocks.append(stock_data)
+            if pools and isinstance(pools, dict) and 'basic_layer' in pools:
+                basic_layer = pools['basic_layer']
+                if hasattr(basic_layer, 'iterrows') and hasattr(basic_layer, 'empty') and not isinstance(basic_layer, list):  # DataFrame
+                    for _, stock in basic_layer.iterrows():  # type: ignore
+                        stock_data = StockData(
+                            code=str(stock['stock_code']),
+                            name=str(stock.get('name', stock['stock_code'])),
+                            price=float(stock.get('current_price', 0)),
+                            market_cap=float(stock.get('market_cap', 0)),
+                            score=float(stock['score'])
+                        )
+                        self._basic_stocks.append(stock_data)
+                elif isinstance(basic_layer, list):  # List of dicts
+                    for stock in basic_layer:
+                        stock_data = StockData(
+                            code=str(stock['stock_code']),
+                            name=str(stock.get('name', stock['stock_code'])),
+                            price=float(stock.get('current_price', 0)),
+                            market_cap=float(stock.get('market_cap', 0)),
+                            score=float(stock['score'])
+                        )
+                        self._basic_stocks.append(stock_data)
                     
             # 加载观察层股票
-            if pools and pools.get('watch_layer'):
-                for stock in pools['watch_layer']:
-                    stock_data = StockData(
-                        code=stock['stock_code'],
-                        name=stock.get('name', stock['stock_code']),
-                        price=stock.get('current_price', 0),
-                        market_cap=stock.get('market_cap', 0),
-                        score=stock['score']
-                    )
-                    self._watch_stocks.append(stock_data)
+            if pools and isinstance(pools, dict) and 'watch_layer' in pools:
+                watch_layer = pools['watch_layer']
+                if hasattr(watch_layer, 'iterrows') and hasattr(watch_layer, 'empty') and not isinstance(watch_layer, list):  # DataFrame
+                    for _, stock in watch_layer.iterrows():  # type: ignore
+                        stock_data = StockData(
+                            code=str(stock['stock_code']),
+                            name=str(stock.get('name', stock['stock_code'])),
+                            price=float(stock.get('current_price', 0)),
+                            market_cap=float(stock.get('market_cap', 0)),
+                            score=float(stock['score'])
+                        )
+                        self._watch_stocks.append(stock_data)
+                elif isinstance(watch_layer, list):  # List of dicts
+                    for stock in watch_layer:
+                        stock_data = StockData(
+                            code=str(stock['stock_code']),
+                            name=str(stock.get('name', stock['stock_code'])),
+                            price=float(stock.get('current_price', 0)),
+                            market_cap=float(stock.get('market_cap', 0)),
+                            score=float(stock['score'])
+                        )
+                        self._watch_stocks.append(stock_data)
                     
             # 加载核心层股票
-            if pools and pools.get('core_layer'):
-                for stock in pools['core_layer']:
-                    stock_data = StockData(
-                        code=stock['stock_code'],
-                        name=stock.get('name', stock['stock_code']),
-                        price=stock.get('current_price', 0),
-                        market_cap=stock.get('market_cap', 0),
-                        score=stock['score']
-                    )
-                    self._core_stocks.append(stock_data)
+            if pools and isinstance(pools, dict) and 'core_layer' in pools:
+                core_layer = pools['core_layer']
+                if hasattr(core_layer, 'iterrows') and hasattr(core_layer, 'empty') and not isinstance(core_layer, list):  # DataFrame
+                    for _, stock in core_layer.iterrows():  # type: ignore
+                        stock_data = StockData(
+                            code=str(stock['stock_code']),
+                            name=str(stock.get('name', stock['stock_code'])),
+                            price=float(stock.get('current_price', 0)),
+                            market_cap=float(stock.get('market_cap', 0)),
+                            score=float(stock['score'])
+                        )
+                        self._core_stocks.append(stock_data)
+                elif isinstance(core_layer, list):  # List of dicts
+                    for stock in core_layer:
+                        stock_data = StockData(
+                            code=str(stock['stock_code']),
+                            name=str(stock.get('name', stock['stock_code'])),
+                            price=float(stock.get('current_price', 0)),
+                            market_cap=float(stock.get('market_cap', 0)),
+                            score=float(stock['score'])
+                        )
+                        self._core_stocks.append(stock_data)
                     
             return True
         except Exception as e:
@@ -195,8 +563,16 @@ class StockMonitorModel:
                 
             kline_data = []
             for index, row in raw_data.iterrows():
+                # 确保index是datetime类型
+                if isinstance(index, str):
+                    from datetime import datetime
+                    timestamp = datetime.fromisoformat(index.replace('Z', '+00:00'))
+                elif hasattr(index, 'to_pydatetime'):  # pandas Timestamp
+                    timestamp = index.to_pydatetime()  # type: ignore
+                else:
+                    timestamp = index if isinstance(index, datetime) else datetime.now()
                 kline = KLineData(
-                    timestamp=index,
+                    timestamp=timestamp,  # type: ignore
                     open_price=row['open'],
                     high_price=row['high'],
                     low_price=row['low'],
@@ -229,14 +605,16 @@ class StockMonitorModel:
             # 如果没有指定股票池，使用核心池作为默认
             target_pool = stock_pool if stock_pool is not None else {stock.code for stock in self._core_stocks}
             
-            all_events = get_indicators().get_all_events(target_pool)
-            for event in all_events:
-                event_data = EventData(
-                    time=event.get('time', ''),
-                    code=event.get('code', ''),
-                    event=event.get('description', '')
-                )
-                self._events.append(event_data)
+            indicators = get_indicators()
+            if indicators is not None:
+                all_events = indicators.get_all_events(target_pool)
+                for event in all_events:  # type: ignore
+                    event_data = EventData(
+                        time=event.get('time', ''),
+                        code=event.get('code', ''),
+                        event=event.get('description', '')
+                    )
+                    self._events.append(event_data)
         except Exception as e:
             print(f"加载事件数据失败: {e}")
     
@@ -246,14 +624,16 @@ class StockMonitorModel:
             from modules.data_interface import get_indicators
             self._current_stock_events.clear()
             self._current_stock_code = stock_code
-            stock_events = get_indicators().get_stock_events(stock_code)
-            for event in stock_events:
-                event_data = EventData(
-                    time=event.get('time', ''),
-                    code=stock_code,
-                    event=event.get('description', '')
-                )
-                self._current_stock_events.append(event_data)
+            indicators = get_indicators()
+            if indicators is not None:
+                stock_events = indicators.get_stock_events(stock_code)
+                for event in stock_events:  # type: ignore
+                    event_data = EventData(
+                        time=event.get('time', ''),
+                        code=stock_code,
+                        event=event.get('description', '')
+                    )
+                    self._current_stock_events.append(event_data)
         except Exception as e:
             print(f"加载股票事件失败: {e}")
     
@@ -711,23 +1091,44 @@ def create_mvp_application():
 
 
 def main_mvp():
-    """MVP版本的主函数"""
-    try:
-        import sys
-        
-        # 初始化rqdatac
-        print("正在初始化系统...")
-        
-        # 创建并启动MVP应用
-        app = create_mvp_application()
-        app.start()
-        
-    except KeyboardInterrupt:
-        print("\n程序被用户中断")
-    except Exception as e:
-        print(f"程序运行出错: {e}")
-        import traceback
-        traceback.print_exc()
+    """MVP版本的主函数 - 支持命令行参数"""
+    parser = argparse.ArgumentParser(description='股票监控程序管理工具')
+    parser.add_argument('action', nargs='?', choices=['status', 'monitor', 'analyze', 'profile', 'kill'],
+                       help='操作类型: status(查看状态), monitor(实时监控), analyze(程序分析), profile(性能分析), kill(终止程序)')
+    parser.add_argument('--gui', action='store_true', help='启动GUI界面（默认行为）')
+
+    args = parser.parse_args()
+
+    # 如果没有提供action参数或指定了--gui，启动GUI
+    if args.action is None or args.gui:
+        try:
+            import sys
+
+            # 初始化rqdatac
+            print("正在初始化系统...")
+
+            # 创建并启动MVP应用
+            app = create_mvp_application()
+            app.start()
+
+        except KeyboardInterrupt:
+            print("\n程序被用户中断")
+        except Exception as e:
+            print(f"程序运行出错: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        # 执行工具命令
+        if args.action == 'status':
+            show_status()
+        elif args.action == 'monitor':
+            monitor_memory()
+        elif args.action == 'analyze':
+            analyze_program()
+        elif args.action == 'profile':
+            profile_memory()
+        elif args.action == 'kill':
+            kill_process()
 
 
 if __name__ == "__main__":

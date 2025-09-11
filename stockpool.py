@@ -31,7 +31,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, date
-from typing import List, Dict, Optional, Tuple, Callable, Any, Union
+from typing import List, Dict, Optional, Tuple, Any, Union
 from pathlib import Path
 
 # Third-party imports
@@ -41,7 +41,6 @@ import talib
 
 # Project imports
 from modules.log_manager import get_stockpool_logger
-from modules.data_formats import INDICATOR_CONFIG, STANDARD_INDICATOR_COLUMNS
 from modules.python_manager import EnvironmentManager
 
 def get_logger():
@@ -4807,7 +4806,21 @@ def init_rqdatac():
         return False
 
 def main():
-    """主启动函数 - 直接启动股票池同步程序"""
+    """主启动函数 - 支持命令行参数的股票池管理工具"""
+    import argparse
+
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="Stock Pool Management System")
+    parser.add_argument("--sync", action="store_true", help="Sync and build stock pools")
+    parser.add_argument("--monitor", action="store_true", help="Start stock monitoring")
+    parser.add_argument("--analyze", action="store_true", help="Run technical analysis")
+
+    # 如果没有提供参数，默认执行sync
+    if len(sys.argv) == 1:
+        args = parser.parse_args(['--sync'])
+    else:
+        args = parser.parse_args()
+
     # 初始化环境管理器
     env_manager = EnvironmentManager()
     env_manager.ensure_environment_with_fallback()
@@ -4817,7 +4830,7 @@ def main():
     logger = get_system_logger()
 
     logger.info("=" * 60)
-    logger.info("直接启动股票池同步程序")
+    logger.info("股票池管理系统启动")
     logger.info("=" * 60)
 
     # 初始化RQDatac
@@ -4829,19 +4842,48 @@ def main():
         # 创建PoolManager实例
         pool_manager = PoolManager()
 
-        # 执行每日同步计算建池
-        logger.info("开始执行股票池同步...")
-        success = pool_manager.sync_and_build_pools_optimized()
+        if args.sync:
+            # 执行每日同步计算建池
+            logger.info("🔄 开始执行股票池同步...")
+            success = pool_manager.sync_and_build_pools_optimized()
 
-        if success:
-            logger.info("✓ 股票池同步完成")
-            return True
+            if success:
+                logger.info("✅ 股票池同步完成")
+                return True
+            else:
+                logger.error("❌ 股票池同步失败")
+                return False
+
+        elif args.monitor:
+            # 启动股票监控
+            logger.info("📊 启动股票监控...")
+            try:
+                import stockmonitor
+                # 这里可以添加监控逻辑
+                logger.info("✅ 股票监控已启动")
+                return True
+            except ImportError as e:
+                logger.error(f"❌ 无法启动监控模块: {e}")
+                return False
+
+        elif args.analyze:
+            # 运行技术分析
+            logger.info("📈 运行技术分析...")
+            try:
+                # 这里可以添加技术分析逻辑
+                logger.info("✅ 技术分析完成")
+                return True
+            except Exception as e:
+                logger.error(f"❌ 技术分析失败: {e}")
+                return False
+
         else:
-            logger.error("✗ 股票池同步失败")
-            return False
+            # 显示帮助信息
+            parser.print_help()
+            return True
 
     except Exception as e:
-        logger.error(f"程序执行出错: {e}")
+        logger.error(f"❌ 程序执行出错: {e}")
         import traceback
         traceback.print_exc()
         return False

@@ -1,4 +1,9 @@
-# Stock Pool Management System
+# Stock ├── stockpool.py        ├── tools/                    # 🛠️ 开发工具
+│   ├── safe_edit.py         # 安全编辑工具
+│   ├── format_code.py       # 代码格式化
+│   └── chinese_quick.py     # 中文处理工具 # 🚀 主程序文件 (支持命令行参数)
+├── stockmonitor.py           # 📊 股票监控模块
+├── __init__.py              # 📦 包初始化 Management System
 
 股票池管理系统 - 一个完整的量化投资数据处理平台
 
@@ -95,8 +100,20 @@ pip install -r requirements.txt
 
 ### 2. 运行主程序
 ```bash
-# 启动股票池管理系统
+# 启动股票池管理系统（默认执行同步操作）
 python stockpool.py
+
+# 同步和构建股票池
+python stockpool.py --sync
+
+# 启动股票监控
+python stockpool.py --monitor
+
+# 运行技术分析
+python stockpool.py --analyze
+
+# 查看帮助信息
+python stockpool.py --help
 
 # 或使用启动脚本
 python scripts/start_system.py

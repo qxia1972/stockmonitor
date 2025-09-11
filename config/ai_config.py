@@ -1798,7 +1798,7 @@ def test_import_issues():
 
     # 尝试导入可能不存在的模块
     try:
-        import nonexistent_module
+        import nonexistent_module  # type: ignore
         print("✓ 非预期模块导入成功")
     except ImportError as e:
 
@@ -1815,7 +1815,7 @@ def test_import_issues():
 
         # 添加到路径并导入
         sys.path.insert(0, str(temp_dir))
-        import test_module
+        import test_module  # type: ignore
         result = test_module.test_function()
         print(f"[OK] 动态模块导入成功: {result}")
 
@@ -3775,7 +3775,7 @@ def test_import_issues():
 
     # 尝试导入可能不存在的模块
     try:
-        import nonexistent_module
+        import nonexistent_module  # type: ignore
         print("✓ 非预期模块导入成功")
     except ImportError as e:
 
@@ -3792,7 +3792,7 @@ def test_import_issues():
 
         # 添加到路径并导入
         sys.path.insert(0, str(temp_dir))
-        import test_module
+        import test_module  # type: ignore
         result = test_module.test_function()
         print(f"[OK] 动态模块导入成功: {result}")
 

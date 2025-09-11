@@ -1,0 +1,65 @@
+{
+    "include": [
+        "."
+    ],
+    "exclude": [
+        "**/__pycache__",
+        "**/.pytest_cache",
+        "**/node_modules",
+        "**/backup",
+        "**/cache",
+        "**/logs",
+        "**/*.pyc",
+        "**/.vscode"
+    ],
+    "pythonVersion": "3.13",
+    "pythonPlatform": "Linux",
+    "executionEnvironments": [
+        {
+            "root": ".",
+            "python": "/home/xiaqing/miniconda/bin/python",
+            "extraPaths": [
+                ".",
+                "./modules",
+                "/home/xiaqing/miniconda/lib/python3.13/site-packages"
+            ]
+        }
+    ],
+    "typeCheckingMode": "basic",
+    "useLibraryCodeForTypes": true,
+    "reportMissingImports": "warning",
+    "reportMissingTypeStubs": "none",
+    "reportImportCycles": "error",
+    "reportUnusedImport": "warning",
+    "reportUnusedClass": "warning",
+    "reportUnusedFunction": "warning",
+    "reportUnusedVariable": "warning",
+    "reportDuplicateImport": "warning",
+    "reportConstantRedefinition": "warning",
+    "reportIncompatibleMethodOverride": "error",
+    "reportIncompatibleVariableOverride": "error",
+    "reportInconsistentConstructor": "error",
+    "reportOverlappingOverloads": "error",
+    "reportMissingSuperCall": "warning",
+    "reportUninitializedInstanceVariable": "none",
+    "reportCallInDefaultInitializer": "none",
+    "reportUnnecessaryIsInstance": "information",
+    "reportUnnecessaryCast": "information",
+    "reportUnnecessaryComparison": "information",
+    "reportAssertAlwaysTrue": "warning",
+    "reportSelfClsParameterName": "warning",
+    "reportImplicitStringConcatenation": "none",
+    "reportUndefinedVariable": "error",
+    "reportUnboundVariable": "error",
+    "reportInvalidStubStatement": "error",
+    "reportIncompleteStub": "error",
+    "reportUnsupportedDunderAll": "warning",
+    "reportUnusedCoroutine": "error",
+    "strictListInference": false,
+    "strictDictionaryInference": false,
+    "strictParameterNoneValue": false,
+    "strictSetInference": false,
+    "stubPath": "./typings",
+    "venvPath": "/home/xiaqing/miniconda",
+    "venv": "base"
+}
