@@ -514,101 +514,6 @@ class PoolManager:
             self.logger.error(f"数据质量评估失败: {e}")
             return {}
 
-    def process_daily_sync_caculate_buildpool(self) -> bool:
-        """运行每日同步、计算和构建股票池的完整流程"""
-        try:
-            self.logger.info("🚀 开始每日股票池同步...")
-
-            # ===== 第一阶段：获取股票列表 =====
-            self.logger.info("📋 第一步：获取A股股票列表...")
-            stock_list_df = self.data_store.fetch_stock_list()
-
-            if stock_list_df is None or stock_list_df.empty:
-                self.logger.error("❌ 无法获取股票列表，同步失败")
-                return False
-
-            # 提取股票代码列表
-            stock_codes = stock_list_df['order_book_id'].tolist()
-            self.logger.info(f"✅ 获取到 {len(stock_codes)} 只股票")
-
-            # ===== 第二阶段：批量获取基本面数据 =====
-            self.logger.info("� 第二步：批量获取基本面数据...")
-            target_date = self.data_store.get_target_trading_date()
-            if not target_date:
-                self.logger.error("❌ 无法确定目标交易日，同步失败")
-                return False
-            self.logger.info(f"🎯 目标分析日期: {target_date} (使用最后一个已完成交易日的数据)")
-
-            # 计算历史数据范围
-            start_date = (datetime.strptime(target_date, '%Y-%m-%d') -
-                         timedelta(days=self.config['history_days'])).strftime('%Y-%m-%d')
-            self.logger.info(f"📅 历史数据范围: {start_date} 至 {target_date}")
-
-            # 批量获取估值数据（包含基本面信息）
-            self.logger.info("💰 获取估值数据（市值、PE、PB等）...")
-            valuation_data = self._batch_get_valuation_data(stock_codes, target_date, return_dataframe=True)
-            if isinstance(valuation_data, pd.DataFrame) and not valuation_data.empty:
-                valuation_dict = valuation_data.set_index('stock_code').to_dict('index')
-                self.logger.info(f"✅ 获取到 {len(valuation_data)} 只股票的估值数据")
-            else:
-                valuation_dict = {}
-                self.logger.warning("⚠️ 未获取到估值数据")
-
-            # ===== 第三阶段：批量获取价格序列数据 =====
-            self.logger.info("📈 第三步：批量获取价格序列数据...")
-            price_data = self._batch_get_price_data(stock_codes, start_date, target_date)
-            valid_price_stocks = [code for code, df in price_data.items() if df is not None and not df.empty]
-            self.logger.info(f"✅ 获取到 {len(valid_price_stocks)} 只股票的价格数据")
-
-            # ===== 第四阶段：计算技术指标 =====
-            self.logger.info("🔧 第四步：计算技术指标...")
-            precomputed_data = {}
-            processed_count = 0
-
-            for stock_code in stock_codes:
-                try:
-                    processed_count += 1
-                    if processed_count % 100 == 0:
-                        self.logger.info(f"⏳ 已处理 {processed_count}/{len(stock_codes)} 只股票...")
-
-                    # 获取基本面数据
-                    stock_info = valuation_dict.get(stock_code, {'stock_code': stock_code})
-
-                    # 获取价格数据
-                    price_df = price_data.get(stock_code)
-
-                    if price_df is not None and not price_df.empty:
-                        # 计算技术指标
-                        technical_indicators = self.calculate_technical_indicators(price_df, stock_code)
-
-                        precomputed_data[stock_code] = {
-                            'stock_info': stock_info,
-                            'technical_indicators': technical_indicators
-                        }
-                    else:
-                        self.logger.debug(f"⚠️ 股票 {stock_code} 无价格数据，跳过")
-
-                except Exception as e:
-                    self.logger.warning(f"⚠️ 处理股票 {stock_code} 时出错: {e}")
-                    continue
-
-            self.logger.info(f"✅ 技术指标计算完成: {len(precomputed_data)} 只股票")
-
-            # ===== 第五阶段：构建股票池（优化版本，直接使用DataFrame） =====
-            self.logger.info("🏗️ 第五步：构建三个股票池...")
-            result = self.build_all_pools_from_precomputed_data(precomputed_data, target_date)
-
-            if result and all(not df.empty for df in result.values()):
-                self.logger.info("✅ 股票池构建成功")
-                return True
-            else:
-                self.logger.error("❌ 股票池构建失败")
-                return False
-
-        except Exception as e:
-            self.logger.error(f"❌ 每日同步失败: {e}")
-            return False
-
     def build_stock_pool(self, scored_stocks: Union[List[Dict], pd.DataFrame], target_date: Optional[str] = None) -> Dict[str, pd.DataFrame]:
         """
         构建三个股票池 - 优化版本，支持DataFrame输入以减少转换开销
@@ -748,7 +653,7 @@ class PoolManager:
                 'core_pool': pd.DataFrame()
             }
 
-    def _batch_get_valuation_data(self, stock_codes: List[str], target_date: str,
+    def _batch_fetch_valuation_data(self, stock_codes: List[str], target_date: str,
                                  return_dataframe: bool = False) -> Union[List[Dict], pd.DataFrame]:
         """
         批量获取股票估值数据 - 优化版本
@@ -822,7 +727,7 @@ class PoolManager:
 
             return basic_info_list
 
-    def _batch_get_price_data(self, stock_codes: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
+    def _batch_fetch_price_data(self, stock_codes: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
         """
         批量获取股票价格数据
 
@@ -1392,6 +1297,120 @@ class PoolManager:
             return False
 
         return True
+
+    def sync_and_build_pools_optimized(self) -> bool:
+        """运行每日同步、计算和构建股票池的完整流程 - 优化版本，减少数据拷贝"""
+        try:
+            self.logger.info("🚀 开始每日股票池同步（优化版本）...")
+
+            # ===== 第一阶段：获取股票列表 =====
+            self.logger.info("📋 第一步：获取A股股票列表...")
+            stock_list_df = self.data_store.fetch_stock_list()
+
+            if stock_list_df is None or stock_list_df.empty:
+                self.logger.error("❌ 无法获取股票列表，同步失败")
+                return False
+
+            # 直接使用DataFrame，避免转换为列表
+            stock_codes = stock_list_df['order_book_id'].tolist()
+            self.logger.info(f"✅ 获取到 {len(stock_codes)} 只股票")
+
+            # ===== 第二阶段：批量获取估值数据（DataFrame格式） =====
+            self.logger.info("💰 第二步：批量获取估值数据...")
+            target_date = self.data_store.get_target_trading_date()
+            if not target_date:
+                self.logger.error("❌ 无法确定目标交易日，同步失败")
+                return False
+            self.logger.info(f"🎯 目标分析日期: {target_date}")
+
+            # 获取DataFrame格式的估值数据
+            valuation_df = self._batch_fetch_valuation_data(stock_codes, target_date, return_dataframe=True)
+            if not isinstance(valuation_df, pd.DataFrame) or valuation_df.empty:
+                self.logger.warning("⚠️ 未获取到估值数据")
+                valuation_df = pd.DataFrame()
+
+            # ===== 第三阶段：批量获取价格数据 =====
+            self.logger.info("📈 第三步：批量获取价格序列数据...")
+            start_date = (datetime.strptime(target_date, '%Y-%m-%d') -
+                         timedelta(days=self.config['history_days'])).strftime('%Y-%m-%d')
+            self.logger.info(f"📅 历史数据范围: {start_date} 至 {target_date}")
+
+            price_data = self._batch_fetch_price_data(stock_codes, start_date, target_date)
+            valid_price_stocks = [code for code, df in price_data.items() if df is not None and not df.empty]
+            self.logger.info(f"✅ 获取到 {len(valid_price_stocks)} 只股票的价格数据")
+
+            # ===== 第四阶段：直接构建评分DataFrame =====
+            self.logger.info("🔧 第四步：构建评分DataFrame...")
+
+            # 直接创建评分DataFrame，避免中间字典转换
+            scored_rows = []
+
+            for stock_code in stock_codes:
+                try:
+                    # 从DataFrame中获取股票信息
+                    if isinstance(valuation_df, pd.DataFrame) and not valuation_df.empty:
+                        stock_info_row = valuation_df[valuation_df['stock_code'] == stock_code]
+                        stock_info = stock_info_row.iloc[0].to_dict() if not stock_info_row.empty else {'stock_code': stock_code}
+                    else:
+                        stock_info = {'stock_code': stock_code}
+
+                    # 获取价格数据
+                    price_df = price_data.get(stock_code)
+
+                    if price_df is not None and not price_df.empty:
+                        # 计算技术指标
+                        technical_indicators = self.calculate_technical_indicators(price_df, stock_code)
+
+                        # 计算评分
+                        basic_score = self.calculate_basic_layer_score(stock_info, technical_indicators)
+                        watch_score = self.calculate_watch_layer_score(stock_info, technical_indicators)
+                        core_score = self.calculate_core_layer_score(stock_info, technical_indicators)
+
+                        # 直接添加到行列表
+                        scored_rows.append({
+                            'stock_code': stock_code,
+                            'basic_score': basic_score,
+                            'watch_score': watch_score,
+                            'core_score': core_score,
+                            'market_cap': stock_info.get('market_cap'),
+                            'pe_ratio': stock_info.get('pe_ratio'),
+                            'pb_ratio': stock_info.get('pb_ratio'),
+                            'current_price': technical_indicators.get('latest_values', {}).get('current_price'),
+                            'rsi': technical_indicators.get('latest_values', {}).get('RSI_14'),
+                            'turnover_rate': technical_indicators.get('latest_values', {}).get('turnover_rate'),
+                            'volatility': technical_indicators.get('latest_values', {}).get('volatility_20d'),
+                            'date': target_date
+                        })
+                    else:
+                        self.logger.debug(f"⚠️ 股票 {stock_code} 无价格数据，跳过")
+
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 处理股票 {stock_code} 时出错: {e}")
+                    continue
+
+            # 一次性创建评分DataFrame
+            if scored_rows:
+                df_scored = pd.DataFrame(scored_rows)
+                self.logger.info(f"✅ 评分计算完成: {len(df_scored)} 只股票")
+            else:
+                df_scored = pd.DataFrame()
+                self.logger.warning("⚠️ 无有效评分数据")
+                return False
+
+            # ===== 第五阶段：构建股票池 =====
+            self.logger.info("🏗️ 第五步：构建三个股票池...")
+            result = self.build_stock_pool(df_scored, target_date)
+
+            if result and all(not df.empty for df in result.values()):
+                self.logger.info("✅ 股票池构建成功")
+                return True
+            else:
+                self.logger.error("❌ 股票池构建失败")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ 每日同步失败: {e}")
+            return False
 
     def get_sync_status(self) -> Dict:
         """
@@ -4770,6 +4789,23 @@ class ScoringEngine:
 # 主股票池管理器
 # ============================================================================
 
+def init_rqdatac():
+    """
+    Initialize rqdatac data source connection
+
+    Returns:
+        bool: True if initialization successful, False otherwise
+    """
+    try:
+        logger.info("🔄 Initializing rqdatac connection...")
+        if rqdatac is not None:
+            rqdatac.init()
+        logger.info("✅ rqdatac initialization successful")
+        return True
+    except Exception as e:
+        logger.error(f"❌ rqdatac initialization failed: {e}")
+        return False
+
 def main():
     """主启动函数 - 直接启动股票池同步程序"""
     # 初始化环境管理器
@@ -4785,7 +4821,6 @@ def main():
     logger.info("=" * 60)
 
     # 初始化RQDatac
-    from stockpool_tool import init_rqdatac
     if not init_rqdatac():
         logger.error("RQDatac初始化失败")
         return False
@@ -4796,7 +4831,7 @@ def main():
 
         # 执行每日同步计算建池
         logger.info("开始执行股票池同步...")
-        success = pool_manager.process_daily_sync_caculate_buildpool()
+        success = pool_manager.sync_and_build_pools_optimized()
 
         if success:
             logger.info("✓ 股票池同步完成")
@@ -4809,124 +4844,6 @@ def main():
         logger.error(f"程序执行出错: {e}")
         import traceback
         traceback.print_exc()
-        return False
-
-
-def process_daily_sync_caculate_buildpool_optimized() -> bool:
-    """运行每日同步、计算和构建股票池的完整流程 - 优化版本，减少数据拷贝"""
-    try:
-        logger.info("🚀 开始每日股票池同步（优化版本）...")
-
-        # 创建PoolManager实例
-        manager = PoolManager()
-
-        # ===== 第一阶段：获取股票列表 =====
-        logger.info("📋 第一步：获取A股股票列表...")
-        stock_list_df = manager.data_store.fetch_stock_list()
-
-        if stock_list_df is None or stock_list_df.empty:
-            logger.error("❌ 无法获取股票列表，同步失败")
-            return False
-
-        # 直接使用DataFrame，避免转换为列表
-        stock_codes = stock_list_df['order_book_id'].tolist()
-        logger.info(f"✅ 获取到 {len(stock_codes)} 只股票")
-
-        # ===== 第二阶段：批量获取估值数据（DataFrame格式） =====
-        logger.info("💰 第二步：批量获取估值数据...")
-        target_date = manager.data_store.get_target_trading_date()
-        if not target_date:
-            logger.error("❌ 无法确定目标交易日，同步失败")
-            return False
-        logger.info(f"🎯 目标分析日期: {target_date}")
-
-        # 获取DataFrame格式的估值数据
-        valuation_df = manager._batch_get_valuation_data(stock_codes, target_date, return_dataframe=True)
-        if not isinstance(valuation_df, pd.DataFrame) or valuation_df.empty:
-            logger.warning("⚠️ 未获取到估值数据")
-            valuation_df = pd.DataFrame()
-
-        # ===== 第三阶段：批量获取价格数据 =====
-        logger.info("📈 第三步：批量获取价格序列数据...")
-        start_date = (datetime.strptime(target_date, '%Y-%m-%d') -
-                     timedelta(days=manager.config['history_days'])).strftime('%Y-%m-%d')
-        logger.info(f"📅 历史数据范围: {start_date} 至 {target_date}")
-
-        price_data = manager._batch_get_price_data(stock_codes, start_date, target_date)
-        valid_price_stocks = [code for code, df in price_data.items() if df is not None and not df.empty]
-        logger.info(f"✅ 获取到 {len(valid_price_stocks)} 只股票的价格数据")
-
-        # ===== 第四阶段：直接构建评分DataFrame =====
-        logger.info("🔧 第四步：构建评分DataFrame...")
-
-        # 直接创建评分DataFrame，避免中间字典转换
-        scored_rows = []
-
-        for stock_code in stock_codes:
-            try:
-                # 从DataFrame中获取股票信息
-                if isinstance(valuation_df, pd.DataFrame) and not valuation_df.empty:
-                    stock_info_row = valuation_df[valuation_df['stock_code'] == stock_code]
-                    stock_info = stock_info_row.iloc[0].to_dict() if not stock_info_row.empty else {'stock_code': stock_code}
-                else:
-                    stock_info = {'stock_code': stock_code}
-
-                # 获取价格数据
-                price_df = price_data.get(stock_code)
-
-                if price_df is not None and not price_df.empty:
-                    # 计算技术指标
-                    technical_indicators = manager.calculate_technical_indicators(price_df, stock_code)
-
-                    # 计算评分
-                    basic_score = manager.calculate_basic_layer_score(stock_info, technical_indicators)
-                    watch_score = manager.calculate_watch_layer_score(stock_info, technical_indicators)
-                    core_score = manager.calculate_core_layer_score(stock_info, technical_indicators)
-
-                    # 直接添加到行列表
-                    scored_rows.append({
-                        'stock_code': stock_code,
-                        'basic_score': basic_score,
-                        'watch_score': watch_score,
-                        'core_score': core_score,
-                        'market_cap': stock_info.get('market_cap'),
-                        'pe_ratio': stock_info.get('pe_ratio'),
-                        'pb_ratio': stock_info.get('pb_ratio'),
-                        'current_price': technical_indicators.get('latest_values', {}).get('current_price'),
-                        'rsi': technical_indicators.get('latest_values', {}).get('RSI_14'),
-                        'turnover_rate': technical_indicators.get('latest_values', {}).get('turnover_rate'),
-                        'volatility': technical_indicators.get('latest_values', {}).get('volatility_20d'),
-                        'date': target_date
-                    })
-                else:
-                    logger.debug(f"⚠️ 股票 {stock_code} 无价格数据，跳过")
-
-            except Exception as e:
-                logger.warning(f"⚠️ 处理股票 {stock_code} 时出错: {e}")
-                continue
-
-        # 一次性创建评分DataFrame
-        if scored_rows:
-            df_scored = pd.DataFrame(scored_rows)
-            logger.info(f"✅ 评分计算完成: {len(df_scored)} 只股票")
-        else:
-            df_scored = pd.DataFrame()
-            logger.warning("⚠️ 无有效评分数据")
-            return False
-
-        # ===== 第五阶段：构建股票池 =====
-        logger.info("🏗️ 第五步：构建三个股票池...")
-        result = manager.build_stock_pool(df_scored, target_date)
-
-        if result and all(not df.empty for df in result.values()):
-            logger.info("✅ 股票池构建成功")
-            return True
-        else:
-            logger.error("❌ 股票池构建失败")
-            return False
-
-    except Exception as e:
-        logger.error(f"❌ 每日同步失败: {e}")
         return False
 
 
