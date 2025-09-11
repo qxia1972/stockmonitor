@@ -33,7 +33,8 @@ except ImportError:
 from .data_formats import (
     TIMEFRAME_CONFIG,
     standardize_kline_dataframe,
-    get_supported_timeframes
+    get_supported_timeframes,
+    check_data_quality
 )
 
 # Delayed import of rqdatac to avoid dependency issues during module loading
@@ -233,8 +234,22 @@ class DataStore:
         if df is None or df.empty:
             return df
 
+        # 数据质量检查
+        quality_report = check_data_quality(df)
+        if not quality_report['valid']:
+            print(f"⚠️ 数据质量问题: {quality_report['issues']}")
+            # 仍然尝试标准化，但记录警告
+
         # 使用data_formats模块的标准化函数
-        return standardize_kline_dataframe(df)
+        standardized_df = standardize_kline_dataframe(df)
+        
+        # 再次检查标准化后的数据质量
+        if standardized_df is not None and not standardized_df.empty:
+            final_quality = check_data_quality(standardized_df)
+            if not final_quality['valid']:
+                print(f"❌ 标准化后数据仍有质量问题: {final_quality['issues']}")
+        
+        return standardized_df
     
     def get_unified_kline_data(self, stock_code, timeframe='daily', use_cache=True):
         """

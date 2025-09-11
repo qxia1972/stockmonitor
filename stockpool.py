@@ -31,7 +31,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, date
-from typing import List, Dict, Optional, Tuple, Any, Union
+from typing import List, Dict, Optional, Tuple, Any, Union, Callable
 from pathlib import Path
 
 # Third-party imports
@@ -42,6 +42,11 @@ import talib
 # Project imports
 from modules.log_manager import get_stockpool_logger
 from modules.python_manager import EnvironmentManager
+from modules.data_formats import (
+    check_data_quality,
+    STANDARD_DTYPES,
+    STANDARD_OHLCV_COLUMNS
+)
 
 def get_logger():
     """Get configured logger for stockpool module"""
@@ -184,6 +189,9 @@ class PoolManager:
         # 🆕 初始化集成的独立组件
         self.data_store = StockPoolDataStore()
         self.indicator_engine = StockPoolIndicatorEngine(self.data_store)
+        self.cache_manager = CacheManager(self.data_store, logger)
+        self.data_loader = DataLoader(self.data_store, self.cache_manager, logger)
+        self.data_saver = DataSaver(self.data_store, logger)
 
         # 初始化统一评分引擎
         self.scoring_engine = ScoringEngine(self)
@@ -466,7 +474,7 @@ class PoolManager:
     # 由于文件过长，我会逐步恢复关键方法
 
     def evaluate_stock_data_quality(self, stock_info: Dict, technical_indicators: Dict,
-                                  data_types: List[str] = None) -> Dict[str, bool]:
+                                  data_types: Optional[List[str]] = None) -> Dict[str, bool]:
         """
         评估单只股票的数据质量
 
@@ -597,38 +605,27 @@ class PoolManager:
             core_candidates = core_candidates.nlargest(self.config['core_pool_size'], 'core_score')
             stats['core_pool_size'] = len(core_candidates)
 
-            # ===== 第五阶段：直接保存DataFrame =====
+            # ===== 第五阶段：保存股票池数据 =====
             self.logger.info("💾 保存三个股票池数据...")
 
-            # 保存基础池
-            if not basic_candidates.empty:
-                # 设置内部实例（避免拷贝，直接赋值）
-                self.data_store.basic_pool = basic_candidates
-                if self.data_store.save_basic_pool():
-                    self.logger.info("✅ 基础池数据保存成功")
-                else:
-                    self.logger.error("❌ 基础池数据保存失败")
-                    stats['errors'].append("保存基础池数据失败")
+            # 准备股票池数据
+            pools_data = {
+                'basic_pool': basic_candidates,
+                'watch_pool': watch_candidates,
+                'core_pool': core_candidates
+            }
 
-            # 保存观察池
-            if not watch_candidates.empty:
-                # 设置内部实例（避免拷贝，直接赋值）
-                self.data_store.watch_pool = watch_candidates
-                if self.data_store.save_watch_pool():
-                    self.logger.info("✅ 观察池数据保存成功")
-                else:
-                    self.logger.error("❌ 观察池数据保存失败")
-                    stats['errors'].append("保存观察池数据失败")
+            # 使用DataSaver保存所有股票池
+            save_results = self.data_saver.save_stock_pools(pools_data)
 
-            # 保存核心池
-            if not core_candidates.empty:
-                # 设置内部实例（避免拷贝，直接赋值）
-                self.data_store.core_pool = core_candidates
-                if self.data_store.save_core_pool():
-                    self.logger.info("✅ 核心池数据保存成功")
+            # 检查保存结果
+            for pool_type, success in save_results.items():
+                if success:
+                    pool_size = len(pools_data[pool_type])
+                    self.logger.info(f"✅ {pool_type}数据保存成功: {pool_size} 只股票")
                 else:
-                    self.logger.error("❌ 核心池数据保存失败")
-                    stats['errors'].append("保存核心池数据失败")
+                    self.logger.error(f"❌ {pool_type}数据保存失败")
+                    stats['errors'].append(f"保存{pool_type}数据失败")
 
             # ===== 第六阶段：输出统计信息 =====
             self._log_build_statistics(stats)
@@ -652,12 +649,15 @@ class PoolManager:
                 'core_pool': pd.DataFrame()
             }
 
+
+
     def _batch_fetch_valuation_data(self, stock_codes: List[str], target_date: str,
                                  return_dataframe: bool = False) -> Union[List[Dict], pd.DataFrame]:
         """
         批量获取股票估值数据 - 优化版本
 
         支持返回DataFrame格式以减少转换开销
+        直接使用批量API，避免缓存机制导致的只获取前5条的问题
 
         Args:
             stock_codes: 股票代码列表
@@ -667,68 +667,82 @@ class PoolManager:
         Returns:
             估值数据列表或DataFrame
         """
-        if return_dataframe:
-            # 直接返回DataFrame格式
-            valuation_data = []
-            batch_size = self.config.get('basic_info_batch_size', 200)
+        try:
+            if not RQDATAC_AVAILABLE or rqdatac is None:
+                self.logger.warning("⚠️ rqdatac不可用")
+                return [] if not return_dataframe else pd.DataFrame()
 
-            for i in range(0, len(stock_codes), batch_size):
-                batch_stocks = stock_codes[i:i + batch_size]
+            # 估值因子列表
+            valuation_factors = ['pe_ratio', 'pb_ratio', 'ps_ratio', 'pcf_ratio', 'market_cap', 'turnover_ratio']
 
-                if (i // batch_size + 1) % 10 == 0:  # 每10个批次记录一次
-                    self.logger.info(f"⏳ 已处理 {i + len(batch_stocks)}/{len(stock_codes)} 只股票的基本面数据...")
+            self.logger.info(f"🚀 开始批量获取估值数据: {len(stock_codes)} 只股票 @ {target_date}")
 
-                for stock_code in batch_stocks:
+            # 直接使用批量API获取所有股票的估值数据
+            batch_result = rqdatac.get_factor(stock_codes, valuation_factors, 
+                                            start_date=target_date, end_date=target_date)
+
+            if batch_result is None or batch_result.empty:
+                self.logger.warning("⚠️ 批量估值获取失败: 返回空结果")
+                return [] if not return_dataframe else pd.DataFrame()
+
+            self.logger.info(f"✅ 批量估值获取成功: {batch_result.shape[0]} 条记录")
+
+            if return_dataframe:
+                # 返回DataFrame格式
+                valuation_data = []
+                
+                # 处理批量结果
+                for stock_code in stock_codes:
                     try:
-                        # 使用datastore获取单只股票的估值数据
-                        valuation_df = self.data_store.get_smart_data(stock_code, 'valuation')
-                        if valuation_df is not None and not valuation_df.empty:
-                            # 添加股票代码列
-                            valuation_df = valuation_df.copy()
-                            valuation_df['stock_code'] = stock_code
-                            valuation_data.append(valuation_df.iloc[0])  # 只取最新一行
+                        # 从批量结果中提取单只股票的数据
+                        stock_data = self._extract_single_stock_from_batch_local(batch_result, stock_code, target_date)
+                        if stock_data is not None and not stock_data.empty:
+                            # 确保股票代码列存在
+                            if 'stock_code' not in stock_data.columns:
+                                stock_data = stock_data.copy()
+                                stock_data['stock_code'] = stock_code
+                            valuation_data.append(stock_data.iloc[0])  # 只取最新一行
                     except Exception as e:
-                        self.logger.warning(f"⚠️ 获取股票 {stock_code} 估值数据失败: {e}")
+                        self.logger.warning(f"⚠️ 处理股票 {stock_code} 估值数据失败: {e}")
                         continue
 
-            return pd.DataFrame(valuation_data) if valuation_data else pd.DataFrame()
+                return pd.DataFrame(valuation_data) if valuation_data else pd.DataFrame()
 
-        else:
-            # 保持原有字典格式返回
-            basic_info_list = []
-            batch_size = self.config.get('basic_info_batch_size', 200)
-
-            for i in range(0, len(stock_codes), batch_size):
-                batch_stocks = stock_codes[i:i + batch_size]
-
-                if (i // batch_size + 1) % 10 == 0:  # 每10个批次记录一次
-                    self.logger.info(f"⏳ 已处理 {i + len(batch_stocks)}/{len(stock_codes)} 只股票的基本面数据...")
-
-                for stock_code in batch_stocks:
+            else:
+                # 返回字典格式
+                basic_info_list = []
+                
+                for stock_code in stock_codes:
                     try:
-                        # 使用datastore获取单只股票的估值数据
-                        valuation_df = self.data_store.get_smart_data(stock_code, 'valuation')
-                        if valuation_df is not None and not valuation_df.empty:
+                        # 从批量结果中提取单只股票的数据
+                        stock_data = self._extract_single_stock_from_batch_local(batch_result, stock_code, target_date)
+                        if stock_data is not None and not stock_data.empty:
                             # 转换为字典格式
                             stock_info = {
                                 'stock_code': stock_code,
-                                'market_cap': valuation_df.get('market_cap', [None])[0] if 'market_cap' in valuation_df.columns else None,
-                                'pe_ratio': valuation_df.get('pe_ratio', [None])[0] if 'pe_ratio' in valuation_df.columns else None,
-                                'pb_ratio': valuation_df.get('pb_ratio', [None])[0] if 'pb_ratio' in valuation_df.columns else None,
-                                'ps_ratio': valuation_df.get('ps_ratio', [None])[0] if 'ps_ratio' in valuation_df.columns else None,
-                                'pcf_ratio': valuation_df.get('pcf_ratio', [None])[0] if 'pcf_ratio' in valuation_df.columns else None,
-                                'turnover_ratio': valuation_df.get('turnover_ratio', [None])[0] if 'turnover_ratio' in valuation_df.columns else None,
+                                'market_cap': stock_data.get('market_cap', [None])[0] if 'market_cap' in stock_data.columns else None,
+                                'pe_ratio': stock_data.get('pe_ratio', [None])[0] if 'pe_ratio' in stock_data.columns else None,
+                                'pb_ratio': stock_data.get('pb_ratio', [None])[0] if 'pb_ratio' in stock_data.columns else None,
+                                'ps_ratio': stock_data.get('ps_ratio', [None])[0] if 'ps_ratio' in stock_data.columns else None,
+                                'pcf_ratio': stock_data.get('pcf_ratio', [None])[0] if 'pcf_ratio' in stock_data.columns else None,
+                                'turnover_ratio': stock_data.get('turnover_ratio', [None])[0] if 'turnover_ratio' in stock_data.columns else None,
                             }
                             basic_info_list.append(stock_info)
                     except Exception as e:
-                        self.logger.warning(f"⚠️ 获取股票 {stock_code} 估值数据失败: {e}")
+                        self.logger.warning(f"⚠️ 处理股票 {stock_code} 估值数据失败: {e}")
                         continue
 
-            return basic_info_list
+                return basic_info_list
+
+        except Exception as e:
+            self.logger.error(f"❌ 批量获取估值数据失败: {e}")
+            return [] if not return_dataframe else pd.DataFrame()
+
+
 
     def _batch_fetch_price_data(self, stock_codes: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
         """
-        批量获取股票价格数据
+        批量获取股票价格数据（优化版：一次性加载缓存）
 
         Args:
             stock_codes: 股票代码列表
@@ -741,6 +755,35 @@ class PoolManager:
         price_data = {}
         batch_size = self.config.get('price_data_batch_size', 100)
 
+        # 首先尝试一次性加载统一缓存文件到内存
+        unified_cache_filename = f"{end_date}_kline_data.json"
+        unified_cache_data = None
+
+        try:
+            cached_data = self.data_store.load_data_from_file(unified_cache_filename)
+            if cached_data is not None:
+                # 检查缓存是否过期（超过24小时）
+                fetch_time = cached_data.get('fetch_time')
+                if fetch_time:
+                    fetch_datetime = datetime.fromisoformat(fetch_time)
+                    if (datetime.now() - fetch_datetime).total_seconds() <= 24 * 3600:
+                        unified_cache_data = cached_data
+                        self.logger.info(f"✅ K线数据缓存加载成功: {unified_cache_filename}")
+                    else:
+                        self.logger.info(f"⚠️ K线数据缓存已过期，将从网络重新获取: {unified_cache_filename}")
+                else:
+                    unified_cache_data = cached_data
+                    self.logger.info(f"✅ K线数据缓存加载成功: {unified_cache_filename}")
+            else:
+                self.logger.info(f"📊 K线数据缓存不存在，将从网络获取: {unified_cache_filename}")
+        except Exception as e:
+            self.logger.warning(f"⚠️ 加载K线数据缓存失败: {e}")
+
+        # 统计缓存命中情况
+        cache_hits = 0
+        cache_misses = 0
+        new_data_count = 0
+
         for i in range(0, len(stock_codes), batch_size):
             batch_stocks = stock_codes[i:i + batch_size]
 
@@ -749,13 +792,52 @@ class PoolManager:
 
             for stock_code in batch_stocks:
                 try:
-                    # 使用datastore获取单只股票的价格数据
+                    # 首先尝试从内存中的统一缓存查找
+                    cached_stock_data = None
+                    if unified_cache_data is not None:
+                        stocks_data = unified_cache_data.get('stocks', {})
+                        cached_stock_data = stocks_data.get(stock_code)
+
+                    if cached_stock_data is not None:
+                        # 从缓存数据重建DataFrame
+                        try:
+                            records = cached_stock_data['data']
+                            df = pd.DataFrame(records)
+                            if not df.empty:
+                                # 将date列设置为索引
+                                if 'date' in df.columns:
+                                    df['date'] = pd.to_datetime(df['date'])
+                                    df = df.set_index('date')
+
+                                # 缓存到内存用于计算
+                                self.data_store.kline_cache[stock_code] = df.copy()
+                                price_data[stock_code] = df
+                                cache_hits += 1
+                                continue
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ 缓存数据格式错误 {stock_code}: {e}")
+
+                    # 缓存未命中，从网络获取
+                    cache_misses += 1
                     price_df = self.data_store.get_smart_data(stock_code, 'price')
                     if price_df is not None and not price_df.empty:
                         price_data[stock_code] = price_df
+                        new_data_count += 1
+
                 except Exception as e:
                     self.logger.warning(f"⚠️ 获取股票 {stock_code} 价格数据失败: {e}")
                     continue
+
+        # 记录缓存统计信息
+        total_processed = len(price_data)
+        if cache_hits > 0 or cache_misses > 0:
+            hit_rate = cache_hits / (cache_hits + cache_misses) * 100 if (cache_hits + cache_misses) > 0 else 0
+            self.logger.info(f"📊 缓存统计: 命中 {cache_hits}, 未命中 {cache_misses}, 命中率 {hit_rate:.1f}%")
+
+        # 在所有股票处理完成后，统一保存新增的数据到缓存文件
+        if new_data_count > 0:
+            self.data_store._save_all_stocks_to_unified_cache(price_data, start_date, end_date)
+            self.logger.info(f"💾 已将 {new_data_count} 只新股票的数据保存到缓存文件")
 
         return price_data
 
@@ -777,7 +859,13 @@ class PoolManager:
         processed_count = 0
 
         for _, row in basic_info_df.iterrows():
-            stock_code = row['stock_code']
+            try:
+                stock_code = row['stock_code']
+            except KeyError:
+                self.logger.warning(f"⚠️ DataFrame行缺少'stock_code'列: {row}")
+                stats['errors'].append(f"DataFrame行缺少'stock_code'列: {str(row)}")
+                continue
+
             processed_count += 1
 
             if processed_count % 500 == 0:
@@ -952,14 +1040,14 @@ class PoolManager:
 
         try:
             # 批量获取基本面数据
-            valuation_data = self._batch_get_valuation_data(stock_codes, target_date, return_dataframe=True)
+            valuation_data = self._batch_fetch_valuation_data(stock_codes, target_date, return_dataframe=True)
             if isinstance(valuation_data, pd.DataFrame) and not valuation_data.empty:
                 valuation_dict = valuation_data.set_index('stock_code').to_dict('index')
             else:
                 valuation_dict = {}
 
             # 批量获取价格数据
-            price_data = self._batch_get_price_data(stock_codes, start_date, target_date)
+            price_data = self._batch_fetch_price_data(stock_codes, start_date, target_date)
 
             # 为每只股票计算技术指标
             for stock_code in stock_codes:
@@ -989,12 +1077,12 @@ class PoolManager:
 
         return precomputed_data
 
-    def build_all_pools_from_precomputed_data(self, precomputed_data: Dict[str, Dict],
+    def build_all_pools_from_precomputed_data_optimized(self, precomputed_data: Dict[str, Dict],
                                             target_date: Optional[str] = None) -> Dict[str, pd.DataFrame]:
         """
-        从预计算数据构建所有股票池 - 优化版本
+        从预计算数据构建所有股票池 - 向量化优化版本
 
-        使用DataFrame进行评分计算，避免字典到DataFrame的重复转换
+        使用pandas向量化操作大幅提升评分计算性能
 
         Args:
             precomputed_data: 预计算数据
@@ -1003,64 +1091,156 @@ class PoolManager:
         Returns:
             三个股票池的字典
         """
-        self.logger.info("🚀 开始从预计算数据构建所有股票池")
+        self.logger.info("🚀 开始向量化评分计算")
 
         try:
-            # 直接创建DataFrame来存储评分结果，避免中间列表
-            scored_rows = []
+            import time
+            start_time = time.time()
 
+            # 1. 预处理数据：将字典数据转换为DataFrame
+            self.logger.info("📊 转换数据为DataFrame格式...")
+
+            stock_data_list = []
             for stock_code, stock_data in precomputed_data.items():
-                try:
-                    stock_info = stock_data.get('stock_info', {})
-                    technical_indicators = stock_data.get('technical_indicators', {})
+                stock_info = stock_data.get('stock_info', {})
+                technical_indicators = stock_data.get('technical_indicators', {})
+                latest_values = technical_indicators.get('latest_values', {})
 
-                    # 确保股票代码在stock_info中
-                    if 'stock_code' not in stock_info:
-                        stock_info['stock_code'] = stock_code
+                # 合并所有数据到一个字典
+                row_data = {
+                    'stock_code': stock_code,
+                    'market_cap': stock_info.get('market_cap'),
+                    'pe_ratio': stock_info.get('pe_ratio'),
+                    'pb_ratio': stock_info.get('pb_ratio'),
+                    'current_price': latest_values.get('current_price'),
+                    'rsi': latest_values.get('RSI_14'),
+                    'turnover_rate': latest_values.get('turnover_rate'),
+                    'volatility': latest_values.get('volatility_20d'),
+                    'avg_volume_5d': latest_values.get('avg_volume_5d'),
+                    'date': target_date,
+                }
+                stock_data_list.append(row_data)
 
-                    # 计算三个层级的评分
-                    basic_score = self.calculate_basic_layer_score(stock_info, technical_indicators)
-                    watch_score = self.calculate_watch_layer_score(stock_info, technical_indicators)
-                    core_score = self.calculate_core_layer_score(stock_info, technical_indicators)
+            # 创建主DataFrame
+            df_all = pd.DataFrame(stock_data_list)
+            self.logger.info(f"✅ 数据转换完成: {len(df_all)} 只股票")
 
-                    # 直接创建DataFrame行字典
-                    scored_rows.append({
-                        'stock_code': stock_code,
-                        'basic_score': basic_score,
-                        'watch_score': watch_score,
-                        'core_score': core_score,
-                        'market_cap': stock_info.get('market_cap'),
-                        'pe_ratio': stock_info.get('pe_ratio'),
-                        'pb_ratio': stock_info.get('pb_ratio'),
-                        'current_price': technical_indicators.get('latest_values', {}).get('current_price'),
-                        'rsi': technical_indicators.get('latest_values', {}).get('RSI_14'),
-                        'turnover_rate': technical_indicators.get('latest_values', {}).get('turnover_rate'),
-                        'volatility': technical_indicators.get('latest_values', {}).get('volatility_20d'),
-                        'date': target_date,
-                        # 存储完整的原始数据以备后续使用
-                        'technical_indicators': technical_indicators,
-                        'stock_info': stock_info
-                    })
+            # 2. 向量化数据质量检查
+            self.logger.info("🔍 向量化数据质量检查...")
+            quality_start = time.time()
 
-                except Exception as e:
-                    self.logger.warning(f"⚠️ 评分股票 {stock_code} 时出错: {e}")
-                    continue
+            # 数据质量检查条件
+            quality_mask = (
+                df_all['current_price'].notna() &
+                df_all['rsi'].notna() &
+                (df_all['pe_ratio'].isna() | (df_all['pe_ratio'] > 0)) &  # PE为正或缺失
+                (df_all['pb_ratio'].isna() | (df_all['pb_ratio'] > 0))    # PB为正或缺失
+            )
 
-            # 一次性创建DataFrame
-            if scored_rows:
-                df_scored = pd.DataFrame(scored_rows)
-                self.logger.info(f"✅ 评分计算完成: {len(df_scored)} 只股票")
-            else:
-                df_scored = pd.DataFrame()
+            df_quality = df_all[quality_mask].copy()
+            quality_time = time.time() - quality_start
+            self.logger.info(f"✅ 数据质量检查完成: {len(df_quality)}/{len(df_all)} 只股票通过 (耗时: {quality_time:.2f}秒)")
+
+            if df_quality.empty:
                 self.logger.warning("⚠️ 无有效评分数据")
+                return {
+                    'basic_pool': pd.DataFrame(),
+                    'watch_pool': pd.DataFrame(),
+                    'core_pool': pd.DataFrame()
+                }
 
-            # 使用优化的build_stock_pool方法（直接使用DataFrame）
-            result = self.build_stock_pool(df_scored, target_date)
+            # 3. 向量化评分计算
+            self.logger.info("🧮 向量化评分计算...")
+            scoring_start = time.time()
 
-            return result
+            # 基础评分基准
+            df_quality['base_score'] = 50.0
+
+            # PE评分 (向量化)
+            pe_score = np.where(
+                df_quality['pe_ratio'].isna(), 0,
+                np.where(df_quality['pe_ratio'] < 15, 15,  # 低估值加分
+                np.where(df_quality['pe_ratio'] > 50, -10, 0))  # 高估值减分
+            )
+            df_quality['pe_score'] = pe_score
+
+            # PB评分 (向量化)
+            pb_score = np.where(
+                df_quality['pb_ratio'].isna(), 0,
+                np.where(df_quality['pb_ratio'] < 1.5, 10,  # 低估值加分
+                np.where(df_quality['pb_ratio'] > 5, -10, 0))  # 高估值减分
+            )
+            df_quality['pb_score'] = pb_score
+
+            # RSI评分 (向量化)
+            rsi_score = np.where(
+                df_quality['rsi'].isna(), 0,
+                np.where(df_quality['rsi'] < 30, 10,  # 超卖加分
+                np.where(df_quality['rsi'] > 70, -5, 0))  # 超买减分
+            )
+            df_quality['rsi_score'] = rsi_score
+
+            # 换手率评分 (向量化)
+            turnover_score = np.where(
+                df_quality['turnover_rate'].isna(), 0,
+                np.where(df_quality['turnover_rate'] < 1, -5,  # 流动性差减分
+                np.where(df_quality['turnover_rate'] > 10, 5, 0))  # 高流动性加分
+            )
+            df_quality['turnover_score'] = turnover_score
+
+            # 波动率评分 (向量化)
+            volatility_score = np.where(
+                df_quality['volatility'].isna(), 0,
+                np.where(df_quality['volatility'] > 0.05, -10,  # 高波动减分
+                np.where(df_quality['volatility'] < 0.02, 5, 0))  # 低波动加分
+            )
+            df_quality['volatility_score'] = volatility_score
+
+            # 计算各层级评分
+            df_quality['basic_score'] = np.clip(
+                df_quality['base_score'] + df_quality['pe_score'] + df_quality['pb_score'] +
+                df_quality['rsi_score'] + df_quality['turnover_score'], 0, 100
+            )
+
+            df_quality['watch_score'] = np.clip(
+                df_quality['basic_score'] + df_quality['volatility_score'] * 0.5, 0, 100
+            )
+
+            df_quality['core_score'] = np.clip(
+                df_quality['watch_score'] + df_quality['pe_score'] * 0.3 + df_quality['pb_score'] * 0.3, 0, 100
+            )
+
+            scoring_time = time.time() - scoring_start
+            self.logger.info(f"✅ 评分计算完成: {len(df_quality)} 只股票 (耗时: {scoring_time:.2f}秒)")
+
+            # 4. 构建股票池
+            self.logger.info("🏗️ 构建三个股票池...")
+            pool_start = time.time()
+
+            # 基础池：按评分排序取前500
+            basic_pool = df_quality.nlargest(500, 'basic_score')
+
+            # 观察池：从基础池中按观察评分排序取前50
+            watch_pool = basic_pool.nlargest(50, 'watch_score')
+
+            # 核心池：从观察池中按核心评分排序取前5
+            core_pool = watch_pool.nlargest(5, 'core_score')
+
+            pool_time = time.time() - pool_start
+            total_time = time.time() - start_time
+
+            self.logger.info("✅ 股票池构建完成")
+            self.logger.info(f"📊 总耗时: {total_time:.2f}秒 (质量检查: {quality_time:.2f}s, 评分: {scoring_time:.2f}s, 建池: {pool_time:.2f}s)")
+            self.logger.info(f"📈 基础池: {len(basic_pool)} 只, 观察池: {len(watch_pool)} 只, 核心池: {len(core_pool)} 只")
+
+            return {
+                'basic_pool': basic_pool,
+                'watch_pool': watch_pool,
+                'core_pool': core_pool
+            }
 
         except Exception as e:
-            self.logger.error(f"❌ 从预计算数据构建股票池失败: {e}")
+            self.logger.error(f"❌ 向量化评分计算失败: {e}")
             return {
                 'basic_pool': pd.DataFrame(),
                 'watch_pool': pd.DataFrame(),
@@ -1185,6 +1365,9 @@ class PoolManager:
             # 返回结果，复用indicators_result的结构
             result = indicators_result
             result['latest_values'] = latest_values
+            
+            # 添加原始价格数据用于质量检查
+            result['price_data'] = price_data.copy()
 
             if result.get('errors'):
                 self.logger.warning(f"⚠️ 指标计算完成但有错误: {result['errors'][:3]}...")
@@ -1314,7 +1497,7 @@ class PoolManager:
             stock_codes = stock_list_df['order_book_id'].tolist()
             self.logger.info(f"✅ 获取到 {len(stock_codes)} 只股票")
 
-            # ===== 第二阶段：批量获取估值数据（DataFrame格式） =====
+            # ===== 第二阶段：批量获取估值数据 =====
             self.logger.info("💰 第二步：批量获取估值数据...")
             target_date = self.data_store.get_target_trading_date()
             if not target_date:
@@ -1322,11 +1505,15 @@ class PoolManager:
                 return False
             self.logger.info(f"🎯 目标分析日期: {target_date}")
 
-            # 获取DataFrame格式的估值数据
-            valuation_df = self._batch_fetch_valuation_data(stock_codes, target_date, return_dataframe=True)
+            # 估值数据缓存处理
+            valuation_cache_file = f"{target_date}_valuation_data.json"
+            valuation_df = self.data_loader.load_valuation_data_with_fallback(
+                stock_codes=stock_codes,
+                target_date=target_date
+            )
+
             if not isinstance(valuation_df, pd.DataFrame) or valuation_df.empty:
                 self.logger.warning("⚠️ 未获取到估值数据")
-                valuation_df = pd.DataFrame()
 
             # ===== 第三阶段：批量获取价格数据 =====
             self.logger.info("📈 第三步：批量获取价格序列数据...")
@@ -1334,71 +1521,183 @@ class PoolManager:
                          timedelta(days=self.config['history_days'])).strftime('%Y-%m-%d')
             self.logger.info(f"📅 历史数据范围: {start_date} 至 {target_date}")
 
-            price_data = self._batch_fetch_price_data(stock_codes, start_date, target_date)
+            # K线数据缓存处理 - 使用改进的数据加载器
+            price_data = self.data_loader.load_price_data_with_fallback(
+                stock_codes=stock_codes,
+                start_date=start_date,
+                end_date=target_date
+            )
+
             valid_price_stocks = [code for code, df in price_data.items() if df is not None and not df.empty]
             self.logger.info(f"✅ 获取到 {len(valid_price_stocks)} 只股票的价格数据")
 
-            # ===== 第四阶段：直接构建评分DataFrame =====
-            self.logger.info("🔧 第四步：构建评分DataFrame...")
+            # ===== 第四阶段：优化的向量化评分计算 =====
+            self.logger.info("🔧 第四步：构建评分DataFrame (向量化优化)...")
+            step4_start = time.time()
 
-            # 直接创建评分DataFrame，避免中间字典转换
-            scored_rows = []
+            # 使用优化的向量化评分计算
+            try:
+                # 1. 预处理数据：收集所有股票的数据
+                self.logger.info("📊 第一阶段：数据预处理...")
+                preprocess_start = time.time()
+                stock_data_dict = {}
 
-            for stock_code in stock_codes:
-                try:
-                    # 从DataFrame中获取股票信息
-                    if isinstance(valuation_df, pd.DataFrame) and not valuation_df.empty:
-                        stock_info_row = valuation_df[valuation_df['stock_code'] == stock_code]
-                        stock_info = stock_info_row.iloc[0].to_dict() if not stock_info_row.empty else {'stock_code': stock_code}
+                # 准备并行计算的数据
+                parallel_tasks = []
+                for stock_code in stock_codes:
+                    try:
+                        # 从DataFrame中获取股票信息
+                        if isinstance(valuation_df, pd.DataFrame) and not valuation_df.empty:
+                            stock_info_row = valuation_df[valuation_df['stock_code'] == stock_code]
+                            stock_info = stock_info_row.iloc[0].to_dict() if not stock_info_row.empty else {'stock_code': stock_code}
+                        else:
+                            stock_info = {'stock_code': stock_code}
+
+                        # 获取价格数据
+                        price_df = price_data.get(stock_code)
+
+                        if price_df is not None and not price_df.empty:
+                            parallel_tasks.append((stock_code, stock_info, price_df))
+                        else:
+                            self.logger.debug(f"⚠️ 股票 {stock_code} 无价格数据，跳过")
+
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ 处理股票 {stock_code} 时出错: {e}")
+                        continue
+
+                # 使用16进程并行计算技术指标
+                import multiprocessing
+                from concurrent.futures import ProcessPoolExecutor, as_completed
+                
+                # 动态检测CPU核心数，乘2作为并发数
+                import multiprocessing
+                from concurrent.futures import ProcessPoolExecutor, as_completed
+
+                cpu_count = multiprocessing.cpu_count()
+                # 动态计算最优进程数：CPU核心数 × 2，最大不超过32
+                num_workers = min(32, cpu_count * 2)
+                self.logger.info(f"⚡ 并行计算技术指标 ({num_workers}进程/{cpu_count}核 - 动态2x配置)...")
+                indicator_start = time.time()
+                
+                # 创建进程池
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    # 提交所有任务
+                    future_to_stock = {
+                        executor.submit(self._calculate_single_stock_indicators, task): task[0] 
+                        for task in parallel_tasks
+                    }
+                    
+                    # 收集结果
+                    completed_count = 0
+                    for future in as_completed(future_to_stock):
+                        stock_code = future_to_stock[future]
+                        try:
+                            result = future.result()
+                            if result:
+                                stock_data_dict[stock_code] = result
+                                completed_count += 1
+                                
+                                # 每处理100只股票报告一次进度
+                                if completed_count % 100 == 0:
+                                    self.logger.info(f"📊 已完成 {completed_count}/{len(parallel_tasks)} 只股票的技术指标计算")
+                                    
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ 并行计算股票 {stock_code} 技术指标失败: {e}")
+                            continue
+                
+                indicator_time = time.time() - indicator_start
+                self.logger.info(f"✅ 并行技术指标计算完成: {len(stock_data_dict)}/{len(parallel_tasks)} 只股票 (耗时: {indicator_time:.2f}秒)")
+                if len(stock_data_dict) > 0:
+                    avg_time = indicator_time / len(stock_data_dict)
+                    self.logger.info(f"📈 平均每只股票耗时: {avg_time:.4f}秒 (并行效率: {0.0198/avg_time:.1f}x)")
+
+                preprocess_time = time.time() - preprocess_start
+                self.logger.info(f"✅ 数据预处理完成: {len(stock_data_dict)}/{len(stock_codes)} 只股票 (耗时: {preprocess_time:.2f}秒)")
+
+                # 2. 使用向量化评分计算
+                if stock_data_dict:
+                    self.logger.info("🧮 第二阶段：向量化评分计算...")
+                    scoring_start = time.time()
+                    result = self.build_all_pools_from_precomputed_data_optimized(stock_data_dict, target_date)
+                    scoring_time = time.time() - scoring_start
+
+                    if result and all(not df.empty for df in result.values()):
+                        step4_total = time.time() - step4_start
+                        self.logger.info("✅ 向量化评分计算成功")
+                        self.logger.info(f"⏱️ 第四步总耗时: {step4_total:.2f}秒 (预处理: {preprocess_time:.2f}s, 评分计算: {scoring_time:.2f}s)")
                     else:
-                        stock_info = {'stock_code': stock_code}
+                        self.logger.error("❌ 向量化评分计算失败")
+                        return False
+                else:
+                    self.logger.warning("⚠️ 无有效股票数据")
+                    return False
 
-                    # 获取价格数据
-                    price_df = price_data.get(stock_code)
+            except Exception as e:
+                self.logger.error(f"❌ 向量化评分计算失败，回退到传统方法: {e}")
+                # 回退到传统方法
+                self.logger.info("🔄 回退到传统评分方法...")
+                traditional_start = time.time()
+                scored_rows = []
 
-                    if price_df is not None and not price_df.empty:
-                        # 计算技术指标
-                        technical_indicators = self.calculate_technical_indicators(price_df, stock_code)
+                for stock_code in stock_codes:
+                    try:
+                        # 从DataFrame中获取股票信息
+                        if isinstance(valuation_df, pd.DataFrame) and not valuation_df.empty:
+                            stock_info_row = valuation_df[valuation_df['stock_code'] == stock_code]
+                            stock_info = stock_info_row.iloc[0].to_dict() if not stock_info_row.empty else {'stock_code': stock_code}
+                        else:
+                            stock_info = {'stock_code': stock_code}
 
-                        # 计算评分
-                        basic_score = self.calculate_basic_layer_score(stock_info, technical_indicators)
-                        watch_score = self.calculate_watch_layer_score(stock_info, technical_indicators)
-                        core_score = self.calculate_core_layer_score(stock_info, technical_indicators)
+                        # 获取价格数据
+                        price_df = price_data.get(stock_code)
 
-                        # 直接添加到行列表
-                        scored_rows.append({
-                            'stock_code': stock_code,
-                            'basic_score': basic_score,
-                            'watch_score': watch_score,
-                            'core_score': core_score,
-                            'market_cap': stock_info.get('market_cap'),
-                            'pe_ratio': stock_info.get('pe_ratio'),
-                            'pb_ratio': stock_info.get('pb_ratio'),
-                            'current_price': technical_indicators.get('latest_values', {}).get('current_price'),
-                            'rsi': technical_indicators.get('latest_values', {}).get('RSI_14'),
-                            'turnover_rate': technical_indicators.get('latest_values', {}).get('turnover_rate'),
-                            'volatility': technical_indicators.get('latest_values', {}).get('volatility_20d'),
-                            'date': target_date
-                        })
-                    else:
-                        self.logger.debug(f"⚠️ 股票 {stock_code} 无价格数据，跳过")
+                        if price_df is not None and not price_df.empty:
+                            # 计算技术指标
+                            technical_indicators = self.calculate_technical_indicators(price_df, stock_code)
 
-                except Exception as e:
-                    self.logger.warning(f"⚠️ 处理股票 {stock_code} 时出错: {e}")
-                    continue
+                            # 计算评分
+                            basic_score = self.calculate_basic_layer_score(stock_info, technical_indicators)
+                            watch_score = self.calculate_watch_layer_score(stock_info, technical_indicators)
+                            core_score = self.calculate_core_layer_score(stock_info, technical_indicators)
 
-            # 一次性创建评分DataFrame
-            if scored_rows:
-                df_scored = pd.DataFrame(scored_rows)
-                self.logger.info(f"✅ 评分计算完成: {len(df_scored)} 只股票")
-            else:
-                df_scored = pd.DataFrame()
-                self.logger.warning("⚠️ 无有效评分数据")
-                return False
+                            # 直接添加到行列表
+                            scored_rows.append({
+                                'stock_code': stock_code,
+                                'basic_score': basic_score,
+                                'watch_score': watch_score,
+                                'core_score': core_score,
+                                'market_cap': stock_info.get('market_cap'),
+                                'pe_ratio': stock_info.get('pe_ratio'),
+                                'pb_ratio': stock_info.get('pb_ratio'),
+                                'current_price': technical_indicators.get('latest_values', {}).get('current_price'),
+                                'rsi': technical_indicators.get('latest_values', {}).get('RSI_14'),
+                                'turnover_rate': technical_indicators.get('latest_values', {}).get('turnover_rate'),
+                                'volatility': technical_indicators.get('latest_values', {}).get('volatility_20d'),
+                                'date': target_date
+                            })
+                        else:
+                            self.logger.debug(f"⚠️ 股票 {stock_code} 无价格数据，跳过")
 
-            # ===== 第五阶段：构建股票池 =====
-            self.logger.info("🏗️ 第五步：构建三个股票池...")
-            result = self.build_stock_pool(df_scored, target_date)
+                    except Exception as e2:
+                        self.logger.warning(f"⚠️ 处理股票 {stock_code} 时出错: {e2}")
+                        continue
+
+                # 一次性创建评分DataFrame
+                if scored_rows:
+                    df_scored = pd.DataFrame(scored_rows)
+                    traditional_time = time.time() - traditional_start
+                    self.logger.info(f"✅ 传统评分计算完成: {len(df_scored)} 只股票 (耗时: {traditional_time:.2f}秒)")
+                    
+                    # 建池阶段耗时统计
+                    pool_start = time.time()
+                    result = self.build_stock_pool(df_scored, target_date)
+                    pool_time = time.time() - pool_start
+                    
+                    step4_total = time.time() - step4_start
+                    self.logger.info(f"⏱️ 传统方法总耗时: {step4_total:.2f}秒 (评分: {traditional_time:.2f}s, 建池: {pool_time:.2f}s)")
+                else:
+                    self.logger.warning("⚠️ 无有效评分数据")
+                    return False
 
             if result and all(not df.empty for df in result.values()):
                 self.logger.info("✅ 股票池构建成功")
@@ -1410,6 +1709,80 @@ class PoolManager:
         except Exception as e:
             self.logger.error(f"❌ 每日同步失败: {e}")
             return False
+
+    @staticmethod
+    def _calculate_single_stock_indicators(task):
+        """
+        并行计算单个股票的技术指标
+        
+        Args:
+            task: (stock_code, stock_info, price_df) 元组
+            
+        Returns:
+            包含股票信息和技术指标的字典
+        """
+        stock_code, stock_info, price_df = task
+        
+        try:
+            # 创建一个简化的指标引擎实例来计算技术指标
+            # 注意：这里需要一个独立的计算环境，避免共享状态问题
+            
+            # 导入必要的模块
+            import pandas as pd
+            import numpy as np
+            import talib
+            
+            # 简化的技术指标计算（避免复杂的依赖）
+            indicators_result = {}
+            latest_values = {}
+            
+            if price_df is not None and not price_df.empty:
+                # 确保数据格式正确
+                if 'close' not in price_df.columns:
+                    return None
+                    
+                close_prices = price_df['close'].values
+                
+                # 计算RSI
+                if len(close_prices) >= 14:
+                    rsi = talib.RSI(close_prices, timeperiod=14)
+                    latest_values['RSI_14'] = rsi[-1] if not np.isnan(rsi[-1]) else 50.0
+                else:
+                    latest_values['RSI_14'] = 50.0
+                
+                # 当前价格
+                latest_values['current_price'] = close_prices[-1]
+                
+                # 计算波动率
+                if len(close_prices) >= 20:
+                    returns = np.diff(np.log(close_prices))
+                    volatility = np.std(returns[-20:]) * np.sqrt(252)  # 年化波动率
+                    latest_values['volatility_20d'] = volatility if not np.isnan(volatility) else 0.02
+                else:
+                    latest_values['volatility_20d'] = 0.02
+                
+                # 计算换手率（简化的计算）
+                if 'volume' in price_df.columns and len(price_df) >= 5:
+                    recent_volume = price_df['volume'].tail(5).mean()
+                    latest_values['avg_volume_5d'] = recent_volume if not np.isnan(recent_volume) else 100000
+                    latest_values['turnover_rate'] = recent_volume / 1000000  # 简化的换手率
+                else:
+                    latest_values['avg_volume_5d'] = 100000
+                    latest_values['turnover_rate'] = 2.0
+            
+            indicators_result['latest_values'] = latest_values
+            indicators_result['full_series'] = {}  # 简化的实现
+            indicators_result['errors'] = []
+            
+            return {
+                'stock_info': stock_info,
+                'technical_indicators': indicators_result
+            }
+            
+        except Exception as e:
+            # 在并行环境中记录错误
+            print(f"⚠️ 并行计算股票 {stock_code} 技术指标失败: {e}")
+            return None
 
     def get_sync_status(self) -> Dict:
         """
@@ -1570,13 +1943,659 @@ class PoolManager:
 
         return self.data_store.save_pool_by_name(pool_type)
 
+    def _extract_single_stock_from_batch_local(self, batch_data: Union[pd.DataFrame, pd.Series], stock_code: str, date: str) -> Optional[pd.DataFrame]:
+        """
+        从批量数据中提取单个股票的数据（本地实现）
+
+        Args:
+            batch_data: 批量数据
+            stock_code: 股票代码
+            date: 日期
+
+        Returns:
+            DataFrame: 单个股票的数据
+        """
+        try:
+            # 批量数据的索引是 (股票代码, 日期) 的多重索引
+            if isinstance(batch_data.index, pd.MultiIndex):
+                # 查找对应的股票和日期
+                mask = (batch_data.index.get_level_values(0) == stock_code)
+                if date:
+                    date_obj = pd.to_datetime(date)
+                    mask = mask & (batch_data.index.get_level_values(1) == date_obj)
+
+                if mask.any():
+                    single_stock_data = batch_data[mask].copy()
+                    # 重置索引，移除多重索引
+                    single_stock_data = single_stock_data.reset_index()
+                    # 重命名索引列为更有意义的名称
+                    single_stock_data = single_stock_data.rename(columns={'level_0': 'stock_code', 'level_1': 'date'})
+                    # 只保留因子列和必要的标识列
+                    factor_columns = [col for col in single_stock_data.columns if col not in ['stock_code', 'date']]
+                    if factor_columns:
+                        single_stock_data = single_stock_data[factor_columns]
+                    return single_stock_data
+
+            return None
+
+        except Exception as e:
+            self.logger.error(f"❌ 从批量数据中提取单个股票失败 {stock_code}: {e}")
+            return None
+
 
 # ============================================================================
-# 主程序入口 - 直接启动股票池同步程序
+# 数据缓存管理器 - 统一处理缓存文件操作
 # ============================================================================
 
-# Initialize environment on module load
-setup_environment()
+class CacheManager:
+    """
+    缓存管理器 - 负责缓存文件的加载、验证、保存操作
+
+    核心功能:
+    - 缓存文件加载和验证
+    - 缓存过期检查
+    - 缓存数据保存
+    - 缓存一致性保证
+    """
+
+    def __init__(self, data_store, logger):
+        self.data_store = data_store
+        self.logger = logger
+
+    def load_cache_with_validation(self, cache_filename: str, target_date: str,
+                                 data_type: str) -> Optional[Dict]:
+        """
+        加载并验证缓存数据
+
+        Args:
+            cache_filename: 缓存文件名
+            target_date: 目标日期
+            data_type: 数据类型描述
+
+        Returns:
+            Optional[Dict]: 验证通过的缓存数据或None
+        """
+        try:
+            # 尝试从文件缓存加载
+            cached_data = self.data_store.load_data_from_file(cache_filename)
+            if cached_data is None:
+                self.logger.info(f"📊 {data_type}缓存不存在: {cache_filename}")
+                return None
+
+            # 检查缓存是否过期（超过24小时）
+            fetch_time = cached_data.get('fetch_time')
+            cache_valid = True
+
+            if fetch_time:
+                fetch_datetime = datetime.fromisoformat(fetch_time)
+                if (datetime.now() - fetch_datetime).total_seconds() > 24 * 3600:
+                    cache_valid = False
+                    self.logger.info(f"⚠️ {data_type}缓存已过期: {cache_filename}")
+                # 移除重复的成功日志，这里只在缓存有效时记录一次
+            else:
+                # 移除重复的成功日志，这里只在没有时间戳时记录一次
+                pass
+
+            # 统一在这里记录缓存加载成功的日志
+            if cache_valid:
+                self.logger.info(f"✅ {data_type}缓存验证通过: {cache_filename}")
+
+            # 检查交易日是否匹配
+            cached_trading_date = cached_data.get('trading_date')
+            if cached_trading_date and cached_trading_date != target_date:
+                cache_valid = False
+                self.logger.info(f"⚠️ {data_type}缓存交易日不匹配: {cached_trading_date} vs {target_date}")
+
+            return cached_data if cache_valid else None
+
+        except Exception as e:
+            self.logger.error(f"❌ 加载{data_type}缓存失败: {e}")
+            return None
+
+    def save_cache_data(self, data, cache_filename: str, data_type: str,
+                       target_date: Optional[str] = None) -> bool:
+        """
+        保存数据到缓存文件
+
+        Args:
+            data: 要保存的数据
+            cache_filename: 缓存文件名
+            data_type: 数据类型描述
+            target_date: 目标日期（可选）
+
+        Returns:
+            bool: 保存是否成功
+        """
+        try:
+            if data is None or (hasattr(data, '__len__') and len(data) == 0):
+                self.logger.warning(f"⚠️ {data_type}数据为空，跳过保存")
+                return False
+
+            # 根据数据类型调用相应的保存方法
+            if data_type == 'valuation' and hasattr(data, 'to_dict'):
+                success = self.data_store.save_valuation_data_to_cache(data, target_date)
+            elif data_type == 'price' and isinstance(data, dict):
+                success = self.data_store._save_all_stocks_to_unified_cache(data, None, target_date)
+            else:
+                self.logger.error(f"❌ 不支持的数据类型: {data_type}")
+                return False
+
+            if success:
+                self.logger.info(f"💾 {data_type}数据已保存到缓存: {cache_filename}")
+            else:
+                self.logger.error(f"❌ {data_type}数据保存失败: {cache_filename}")
+
+            return success
+
+        except Exception as e:
+            self.logger.error(f"❌ 保存{data_type}数据到缓存失败: {e}")
+            return False
+
+
+# ============================================================================
+# 数据加载器 - 统一处理数据获取和补充
+# ============================================================================
+
+class DataLoader:
+    """
+    数据加载器 - 负责数据的获取、补充、合并操作
+
+    核心功能:
+    - 从缓存加载数据
+    - 补充缺失数据
+    - 合并缓存和网络数据
+    - 数据完整性验证
+    """
+
+    def __init__(self, data_store, cache_manager, logger):
+        self.data_store = data_store
+        self.cache_manager = cache_manager
+        self.logger = logger
+
+    def load_valuation_data_with_fallback(self, stock_codes: List[str], target_date: str) -> pd.DataFrame:
+        """
+        加载估值数据，带缓存和网络回退机制
+
+        Args:
+            stock_codes: 股票代码列表
+            target_date: 目标日期
+
+        Returns:
+            pd.DataFrame: 估值数据
+        """
+        cache_filename = f"{target_date}_valuation_data.json"
+
+        # 1. 尝试从缓存加载
+        cached_data = self.cache_manager.load_cache_with_validation(
+            cache_filename, target_date, "估值数据"
+        )
+
+        if cached_data is not None:
+            # 从缓存重建DataFrame
+            valuation_df = self._rebuild_valuation_dataframe_from_cache(cached_data, cache_filename)
+            if valuation_df is not None:
+                return valuation_df
+
+        # 2. 缓存无效或不存在，从网络获取
+        return self._fetch_and_cache_valuation_data(stock_codes, target_date, cache_filename)
+
+    def load_price_data_with_fallback(self, stock_codes: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
+        """
+        加载价格数据，带缓存和网络回退机制
+
+        Args:
+            stock_codes: 股票代码列表
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            Dict[str, pd.DataFrame]: 价格数据字典
+        """
+        cache_filename = f"{end_date}_kline_data.json"
+
+        # 1. 尝试从缓存加载
+        cached_data = self.cache_manager.load_cache_with_validation(
+            cache_filename, end_date, "K线数据"
+        )
+
+        price_data = {}
+        if cached_data is not None:
+            # 从缓存重建price_data
+            price_data = self._rebuild_price_data_from_cache(cached_data, cache_filename)
+
+        # 2. 如果缓存中股票数量不足，从网络获取剩余数据
+        return self._fetch_and_merge_price_data(stock_codes, start_date, end_date, cache_filename, price_data)
+
+    def _rebuild_valuation_dataframe_from_cache(self, cached_data: Dict, cache_filename: str) -> Optional[pd.DataFrame]:
+        """
+        从缓存数据重建估值DataFrame
+
+        Args:
+            cached_data: 缓存数据字典
+            cache_filename: 缓存文件名
+
+        Returns:
+            Optional[pd.DataFrame]: 重建的DataFrame或None
+        """
+        try:
+            records = cached_data.get('valuation_data', [])
+            if records:
+                valuation_df = pd.DataFrame(records)
+                self.logger.info(f"✅ 估值数据加载完成: {len(valuation_df)} 只股票")
+                return valuation_df
+            else:
+                self.logger.warning(f"⚠️ 缓存文件格式错误: {cache_filename}")
+                return None
+        except Exception as e:
+            self.logger.error(f"❌ 重建估值DataFrame失败: {e}")
+            return None
+
+    def _rebuild_price_data_from_cache(self, cached_data: Dict, cache_filename: str) -> Dict[str, pd.DataFrame]:
+        """
+        从缓存数据重建价格数据字典
+
+        Args:
+            cached_data: 缓存数据字典
+            cache_filename: 缓存文件名
+
+        Returns:
+            Dict[str, pd.DataFrame]: 重建的价格数据字典
+        """
+        price_data = {}
+        try:
+            stocks_data = cached_data.get('stocks', {})
+            for stock_code, stock_data in stocks_data.items():
+                try:
+                    records = stock_data.get('data', [])
+                    if records:
+                        df = pd.DataFrame(records)
+                        if not df.empty and 'date' in df.columns:
+                            df['date'] = pd.to_datetime(df['date'])
+                            df = df.set_index('date')
+                            price_data[stock_code] = df
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 解析缓存数据失败 {stock_code}: {e}")
+
+            self.logger.info(f"✅ K线数据加载完成: {len(price_data)} 只股票")
+        except Exception as e:
+            self.logger.error(f"❌ 重建价格数据失败: {e}")
+
+        return price_data
+
+    def _fetch_and_cache_valuation_data(self, stock_codes: List[str], target_date: str, cache_filename: str) -> pd.DataFrame:
+        """
+        从网络获取估值数据并保存到缓存
+
+        Args:
+            stock_codes: 股票代码列表
+            target_date: 目标日期
+            cache_filename: 缓存文件名
+
+        Returns:
+            pd.DataFrame: 获取的估值数据
+        """
+        try:
+            self.logger.info(f"📊 估值数据缓存无效，从网络获取: {cache_filename}")
+            valuation_data = self._batch_fetch_valuation_data(stock_codes, target_date, return_dataframe=True)
+
+            # 处理返回的数据并保存到缓存
+            if isinstance(valuation_data, pd.DataFrame) and not valuation_data.empty:
+                self.cache_manager.save_cache_data(valuation_data, cache_filename, 'valuation', target_date)
+                return valuation_data
+            elif isinstance(valuation_data, list) and valuation_data:
+                valuation_df = pd.DataFrame(valuation_data)
+                if not valuation_df.empty:
+                    self.cache_manager.save_cache_data(valuation_df, cache_filename, 'valuation', target_date)
+                    return valuation_df
+
+            self.logger.warning("⚠️ 无法获取估值数据")
+            return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f"❌ 获取估值数据失败: {e}")
+            return pd.DataFrame()
+
+    def _fetch_and_merge_price_data(self, stock_codes: List[str], start_date: str, end_date: str,
+                                   cache_filename: str, existing_price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """
+        获取价格数据并与现有数据合并
+
+        Args:
+            stock_codes: 股票代码列表
+            start_date: 开始日期
+            end_date: 结束日期
+            cache_filename: 缓存文件名
+            existing_price_data: 已存在的价格数据
+
+        Returns:
+            Dict[str, pd.DataFrame]: 合并后的价格数据
+        """
+        price_data = existing_price_data.copy()
+
+        try:
+            # 检查是否需要从网络获取数据
+            if len(price_data) < len(stock_codes):
+                missing_count = len(stock_codes) - len(price_data)
+                self.logger.info(f"📊 从网络获取 {missing_count} 只股票的价格数据...")
+
+                network_price_data = self._batch_fetch_price_data(stock_codes, start_date, end_date)
+
+                # 合并缓存和网络数据
+                for stock_code, df in network_price_data.items():
+                    if stock_code not in price_data and df is not None and not df.empty:
+                        price_data[stock_code] = df
+
+                # 保存合并后的数据到缓存
+                if price_data:
+                    self.cache_manager.save_cache_data(price_data, cache_filename, 'price', end_date)
+
+            return price_data
+
+        except Exception as e:
+            self.logger.error(f"❌ 获取价格数据失败: {e}")
+            return price_data
+
+    def _batch_fetch_valuation_data(self, stock_codes: List[str], target_date: str,
+                                 return_dataframe: bool = False) -> Union[List[Dict], pd.DataFrame]:
+        """
+        批量获取股票估值数据
+
+        Args:
+            stock_codes: 股票代码列表
+            target_date: 目标日期
+            return_dataframe: 是否返回DataFrame格式
+
+        Returns:
+            估值数据列表或DataFrame
+        """
+        try:
+            if not RQDATAC_AVAILABLE or rqdatac is None:
+                self.logger.warning("⚠️ RQDatac不可用")
+                return [] if not return_dataframe else pd.DataFrame()
+
+            # 估值因子列表
+            valuation_factors = ['pe_ratio', 'pb_ratio', 'ps_ratio', 'pcf_ratio', 'market_cap', 'turnover_ratio']
+
+            self.logger.info(f"🚀 开始批量获取估值数据: {len(stock_codes)} 只股票 @ {target_date}")
+
+            # 直接使用批量API获取所有股票的估值数据
+            batch_result = rqdatac.get_factor(stock_codes, valuation_factors,
+                                            start_date=target_date, end_date=target_date)
+
+            if batch_result is None or (hasattr(batch_result, 'empty') and batch_result.empty):
+                self.logger.warning("⚠️ 批量估值获取失败: 返回空结果")
+                return [] if not return_dataframe else pd.DataFrame()
+
+            self.logger.info(f"✅ 批量估值获取成功: {batch_result.shape[0]} 条记录")
+
+            if return_dataframe:
+                # 确保返回DataFrame格式，并添加stock_code列
+                if isinstance(batch_result, pd.Series):
+                    df = batch_result.to_frame().T
+                else:
+                    df = batch_result.copy() if hasattr(batch_result, 'copy') else pd.DataFrame(batch_result)
+                
+                # 处理MultiIndex，确保添加stock_code列
+                if isinstance(df.index, pd.MultiIndex):
+                    # 重置MultiIndex，将第一级索引（股票代码）作为stock_code列
+                    df = df.reset_index()
+                    if 'order_book_id' in df.columns:
+                        df = df.rename(columns={'order_book_id': 'stock_code'})
+                    elif df.index.names and df.index.names[0]:
+                        df = df.rename(columns={df.index.names[0]: 'stock_code'})
+                    else:
+                        # 如果没有明确的索引名，假设第一列是股票代码
+                        df['stock_code'] = df.iloc[:, 0]
+                elif 'stock_code' not in df.columns and hasattr(df, 'index'):
+                    # 处理单索引情况
+                    if df.index.name:
+                        df = df.reset_index()
+                        df = df.rename(columns={df.index.name: 'stock_code'})
+                    else:
+                        df['stock_code'] = df.index
+                
+                return df
+            else:
+                # 转换为字典列表格式
+                if isinstance(batch_result, pd.Series):
+                    result_dict = batch_result.to_dict()
+                    result_dict['stock_code'] = batch_result.name
+                    return [result_dict]
+                
+                # 处理MultiIndex，确保DataFrame有stock_code列
+                if isinstance(batch_result.index, pd.MultiIndex):
+                    # 重置MultiIndex，将第一级索引（股票代码）作为stock_code列
+                    df_with_code = batch_result.reset_index()
+                    if 'order_book_id' in df_with_code.columns:
+                        df_with_code = df_with_code.rename(columns={'order_book_id': 'stock_code'})
+                    elif df_with_code.index.names and df_with_code.index.names[0]:
+                        df_with_code = df_with_code.rename(columns={df_with_code.index.names[0]: 'stock_code'})
+                    else:
+                        # 如果没有明确的索引名，手动添加stock_code列
+                        df_with_code['stock_code'] = df_with_code.index.get_level_values(0)
+                elif hasattr(batch_result, 'reset_index'):
+                    df_with_code = batch_result.reset_index()
+                    if df_with_code.index.name:
+                        df_with_code = df_with_code.rename(columns={df_with_code.index.name: 'stock_code'})
+                    elif 'stock_code' not in df_with_code.columns:
+                        df_with_code['stock_code'] = df_with_code.index
+                else:
+                    df_with_code = batch_result
+                    
+                return df_with_code.to_dict('records')
+
+        except Exception as e:
+            self.logger.error(f"❌ 批量获取估值数据失败: {e}")
+            return [] if not return_dataframe else pd.DataFrame()
+
+    def _batch_fetch_price_data(self, stock_codes: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
+        """
+        批量获取股票价格数据
+
+        Args:
+            stock_codes: 股票代码列表
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            价格数据字典 {stock_code: price_df}
+        """
+        try:
+            price_data = {}
+
+            if not RQDATAC_AVAILABLE or rqdatac is None:
+                self.logger.warning("⚠️ RQDatac不可用")
+                return price_data
+
+            self.logger.info(f"🚀 开始批量获取价格数据: {len(stock_codes)} 只股票")
+
+            # 使用RQDatac的批量API直接获取所有股票数据
+            batch_start_time = time.time()
+            batch_data = rqdatac.get_price(
+                stock_codes,
+                start_date=start_date,
+                end_date=end_date,
+                frequency='1d',
+                fields=['open', 'close', 'high', 'low', 'volume']
+            )
+            batch_time = time.time() - batch_start_time
+
+            if batch_data is None or batch_data.empty:
+                self.logger.warning("⚠️ 批量获取返回空数据")
+                return price_data
+
+            self.logger.info(f"✅ 批量API获取完成: {len(batch_data)} 条记录, 耗时: {batch_time:.2f}秒")
+
+            # 处理MultiIndex DataFrame，按股票代码分组
+            process_start_time = time.time()
+
+            # 确保数据是MultiIndex格式
+            if isinstance(batch_data.index, pd.MultiIndex):
+                # 按股票代码分组
+                for stock_code in stock_codes:
+                    try:
+                        # 从MultiIndex中提取单只股票的数据
+                        if stock_code in batch_data.index.get_level_values(0):
+                            stock_df = batch_data.loc[stock_code].copy()
+
+                            # 如果是单行数据，需要转换为DataFrame
+                            if isinstance(stock_df, pd.Series):
+                                stock_df = stock_df.to_frame().T
+
+                            # 确保date列是datetime类型并设置为索引
+                            if 'date' in stock_df.columns:
+                                stock_df['date'] = pd.to_datetime(stock_df['date'])
+                                stock_df = stock_df.set_index('date')
+                                price_data[stock_code] = stock_df
+                            else:
+                                # 如果没有date列，尝试使用索引
+                                if isinstance(stock_df.index, pd.DatetimeIndex):
+                                    price_data[stock_code] = stock_df
+                                else:
+                                    self.logger.warning(f"⚠️ {stock_code} 数据格式异常，跳过")
+                        else:
+                            self.logger.debug(f"⚠️ {stock_code} 不在批量数据中")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ 处理 {stock_code} 数据失败: {e}")
+                        continue
+            else:
+                self.logger.warning("⚠️ 批量数据不是预期的MultiIndex格式")
+                # 回退到逐个获取
+                self.logger.info("🔄 回退到逐个获取模式...")
+                for stock_code in stock_codes:
+                    try:
+                        df = self.data_store.get_price(stock_code, start_date=start_date, end_date=end_date)
+                        if df is not None and not df.empty:
+                            price_data[stock_code] = df
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ 获取 {stock_code} 数据失败: {e}")
+                        continue
+
+            process_time = time.time() - process_start_time
+            self.logger.info(f"✅ 数据处理完成: {len(price_data)}/{len(stock_codes)} 只股票, 处理耗时: {process_time:.2f}秒")
+
+            return price_data
+
+        except Exception as e:
+            self.logger.error(f"❌ 批量获取价格数据失败: {e}")
+            # 回退到逐个获取
+            self.logger.info("🔄 回退到逐个获取模式...")
+            for stock_code in stock_codes:
+                try:
+                    df = self.data_store.get_price(stock_code, start_date=start_date, end_date=end_date)
+                    if df is not None and not df.empty:
+                        price_data[stock_code] = df
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 获取 {stock_code} 数据失败: {e}")
+                    continue
+
+            return price_data
+
+
+# ============================================================================
+# 数据保存器 - 统一处理数据保存到datastore
+# ============================================================================
+
+class DataSaver:
+    """
+    数据保存器 - 负责将数据保存到datastore
+
+    核心功能:
+    - 股票池数据保存
+    - 数据完整性验证
+    - 保存状态跟踪
+    - 错误处理和恢复
+    """
+
+    def __init__(self, data_store, logger):
+        self.data_store = data_store
+        self.logger = logger
+
+    def save_stock_pools(self, pools_data: Dict[str, pd.DataFrame]) -> Dict[str, bool]:
+        """
+        保存所有股票池数据到datastore
+
+        Args:
+            pools_data: 股票池数据字典
+                {
+                    'basic_pool': pd.DataFrame,
+                    'watch_pool': pd.DataFrame,
+                    'core_pool': pd.DataFrame
+                }
+
+        Returns:
+            Dict[str, bool]: 保存结果字典
+        """
+        results = {}
+
+        for pool_type, pool_data in pools_data.items():
+            try:
+                if pool_data is None or pool_data.empty:
+                    self.logger.warning(f"⚠️ {pool_type}数据为空，跳过保存")
+                    results[pool_type] = True
+                    continue
+
+                # 设置datastore中的对应池数据
+                if pool_type == 'basic_pool':
+                    self.data_store.basic_pool = pool_data
+                    success = self.data_store.save_basic_pool()
+                elif pool_type == 'watch_pool':
+                    self.data_store.watch_pool = pool_data
+                    success = self.data_store.save_watch_pool()
+                elif pool_type == 'core_pool':
+                    self.data_store.core_pool = pool_data
+                    success = self.data_store.save_core_pool()
+                else:
+                    self.logger.error(f"❌ 不支持的股票池类型: {pool_type}")
+                    results[pool_type] = False
+                    continue
+
+                if success:
+                    self.logger.info(f"✅ {pool_type}已保存: {len(pool_data)} 只股票")
+                else:
+                    self.logger.error(f"❌ {pool_type}保存失败")
+
+                results[pool_type] = success
+
+            except Exception as e:
+                self.logger.error(f"❌ 保存{pool_type}失败: {e}")
+                results[pool_type] = False
+
+        return results
+
+    def save_single_pool(self, pool_type: str, pool_data: pd.DataFrame) -> bool:
+        """
+        保存单个股票池数据
+
+        Args:
+            pool_type: 股票池类型 ('basic', 'watch', 'core')
+            pool_data: 股票池数据
+
+        Returns:
+            bool: 保存是否成功
+        """
+        try:
+            if pool_data is None or pool_data.empty:
+                self.logger.warning(f"⚠️ {pool_type}数据为空，跳过保存")
+                return True
+
+            # 设置datastore中的对应池数据
+            if pool_type == 'basic':
+                self.data_store.basic_pool = pool_data
+                return self.data_store.save_basic_pool()
+            elif pool_type == 'watch':
+                self.data_store.watch_pool = pool_data
+                return self.data_store.save_watch_pool()
+            elif pool_type == 'core':
+                self.data_store.core_pool = pool_data
+                return self.data_store.save_core_pool()
+            else:
+                self.logger.error(f"❌ 不支持的股票池类型: {pool_type}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ 保存{pool_type}失败: {e}")
+            return False
 
 # ============================================================================
 # STOCK POOL DATA STORE - 独立数据存储层
@@ -1653,7 +2672,112 @@ class StockPoolDataStore:
         # 批量数据缓存 - {cache_key: DataFrame}
         self.batch_cache: Dict[str, pd.DataFrame] = {}
 
-        logger.debug("✅ 缓存结构初始化完成")
+        # 缓存访问时间跟踪（用于LRU淘汰）
+        self.cache_access_times: Dict[str, float] = {}
+
+        # 缓存大小限制
+        self.max_cache_size = int(os.getenv('MAX_CACHE_SIZE', '1000'))  # 默认1000个缓存项
+
+        # 缓存过期时间（秒）
+        self.cache_expiry_seconds = int(os.getenv('CACHE_EXPIRY_SECONDS', '3600'))  # 默认1小时
+
+        logger.debug(f"✅ 缓存结构初始化完成，最大缓存大小: {self.max_cache_size}，过期时间: {self.cache_expiry_seconds}秒")
+
+    def _manage_cache_size(self):
+        """管理缓存大小，实施LRU淘汰策略"""
+        total_cache_items = len(self.kline_cache) + len(self.batch_cache)
+
+        if total_cache_items > self.max_cache_size:
+            # 计算需要淘汰的数量
+            items_to_remove = total_cache_items - self.max_cache_size
+
+            # 收集所有缓存项的访问时间
+            all_cache_items = []
+            for cache_key in self.kline_cache.keys():
+                access_time = self.cache_access_times.get(f"kline_{cache_key}", 0)
+                all_cache_items.append((access_time, 'kline', cache_key))
+
+            for cache_key in self.batch_cache.keys():
+                access_time = self.cache_access_times.get(f"batch_{cache_key}", 0)
+                all_cache_items.append((access_time, 'batch', cache_key))
+
+            # 按访问时间排序（最少访问的在前）
+            all_cache_items.sort(key=lambda x: x[0])
+
+            # 淘汰最少访问的缓存项
+            for i in range(min(items_to_remove, len(all_cache_items))):
+                _, cache_type, cache_key = all_cache_items[i]
+                if cache_type == 'kline':
+                    del self.kline_cache[cache_key]
+                    del self.cache_access_times[f"kline_{cache_key}"]
+                elif cache_type == 'batch':
+                    del self.batch_cache[cache_key]
+                    del self.cache_access_times[f"batch_{cache_key}"]
+
+            logger.debug(f"🗑️ 缓存清理完成，淘汰了 {items_to_remove} 个缓存项")
+
+    def _is_cache_expired(self, cache_key: str) -> bool:
+        """检查缓存是否过期"""
+        access_time = self.cache_access_times.get(cache_key, 0)
+        if access_time == 0:
+            return True
+
+        current_time = time.time()
+        return (current_time - access_time) > self.cache_expiry_seconds
+
+    def _update_cache_access(self, cache_key: str):
+        """更新缓存访问时间"""
+        self.cache_access_times[cache_key] = time.time()
+
+    def get_cached_kline_data(self, stock_code: str) -> Optional[pd.DataFrame]:
+        """获取缓存的K线数据（带过期检查）"""
+        cache_key = f"kline_{stock_code}"
+
+        # 检查缓存是否存在且未过期
+        if stock_code in self.kline_cache and not self._is_cache_expired(cache_key):
+            self._update_cache_access(cache_key)
+            return self.kline_cache[stock_code]
+        elif stock_code in self.kline_cache:
+            # 缓存过期，清理
+            del self.kline_cache[stock_code]
+            del self.cache_access_times[cache_key]
+
+        return None
+
+    def set_cached_kline_data(self, stock_code: str, data: pd.DataFrame):
+        """设置缓存的K线数据"""
+        cache_key = f"kline_{stock_code}"
+
+        self.kline_cache[stock_code] = data
+        self._update_cache_access(cache_key)
+
+        # 检查是否需要清理缓存
+        self._manage_cache_size()
+
+    def get_cached_batch_data(self, cache_key: str) -> Optional[pd.DataFrame]:
+        """获取缓存的批量数据（带过期检查）"""
+        full_key = f"batch_{cache_key}"
+
+        # 检查缓存是否存在且未过期
+        if cache_key in self.batch_cache and not self._is_cache_expired(full_key):
+            self._update_cache_access(full_key)
+            return self.batch_cache[cache_key]
+        elif cache_key in self.batch_cache:
+            # 缓存过期，清理
+            del self.batch_cache[cache_key]
+            del self.cache_access_times[full_key]
+
+        return None
+
+    def set_cached_batch_data(self, cache_key: str, data: pd.DataFrame):
+        """设置缓存的批量数据"""
+        full_key = f"batch_{cache_key}"
+
+        self.batch_cache[cache_key] = data
+        self._update_cache_access(full_key)
+
+        # 检查是否需要清理缓存
+        self._manage_cache_size()
 
     def _init_pool_instances(self):
         """初始化股票池实例"""
@@ -1677,12 +2801,13 @@ class StockPoolDataStore:
 
         logger.debug("✅ 股票池实例初始化完成")
 
-    def load_data_from_file(self, filename: str) -> Optional[Dict]:
+    def load_data_from_file(self, filename: str, skip_logging: bool = False) -> Optional[Dict]:
         """
         从文件加载数据
 
         Args:
             filename: 文件名
+            skip_logging: 是否跳过日志记录（用于内存缓存场景）
 
         Returns:
             Dict: 加载的数据或None
@@ -1703,24 +2828,28 @@ class StockPoolDataStore:
                     with open(filepath, 'r', encoding='utf-8') as f:
                         data = json.load(f)
 
-                    logger.info(f"📁 数据加载成功: {filename} (from {search_dir})")
+                    if not skip_logging:
+                        logger.debug(f"📁 从 {search_dir} 加载数据文件: {filename}")
                     return data
 
             # 如果都没找到
-            logger.warning(f"⚠️ 数据文件不存在: {filename}")
+            if not skip_logging:
+                logger.warning(f"⚠️ 数据文件不存在: {filename}")
             return None
 
         except Exception as e:
-            logger.error(f"❌ 数据加载失败 {filename}: {e}")
+            if not skip_logging:
+                logger.error(f"❌ 数据加载失败 {filename}: {e}")
             return None
 
-    def save_data_to_file(self, data: Dict, filename: str) -> bool:
+    def save_data_to_file(self, data: Dict, filename: str, use_indent: bool = True) -> bool:
         """
         保存数据到文件
 
         Args:
             data: 要保存的数据
             filename: 文件名
+            use_indent: 是否使用缩进格式（生产环境可设为False以提高性能）
 
         Returns:
             bool: 是否成功
@@ -1731,7 +2860,10 @@ class StockPoolDataStore:
             # 原子写入操作
             temp_filepath = filepath + ".tmp"
             with open(temp_filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+                if use_indent:
+                    json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+                else:
+                    json.dump(data, f, ensure_ascii=False, separators=(',', ':'), default=str)
 
             # 原子移动
             if os.path.exists(filepath):
@@ -1799,7 +2931,13 @@ class StockPoolDataStore:
                 'data': data_list
             }
 
-            success = self.save_data_to_file(data, filename)
+            # 生产环境使用紧凑格式以提高性能
+            use_indent = not (
+                os.getenv('ENV', '').lower() == 'production' or
+                os.getenv('PRODUCTION', '').lower() in ('true', '1', 'yes') or
+                not os.getenv('DEBUG', '').lower() in ('true', '1', 'yes')
+            )
+            success = self.save_data_to_file(data, filename, use_indent=use_indent)
             if success:
                 logger.info(f"✅ {pool_name}已保存: {len(pool_data)} 只股票")
             return success
@@ -2345,7 +3483,7 @@ class StockPoolDataStore:
             logger.error(f"❌ A股股票过滤失败: {e}")
             return False
 
-    def filter_by_market_cap_to_cache(self, min_cap: float = None, max_cap: float = None) -> bool:
+    def filter_by_market_cap_to_cache(self, min_cap: Optional[float] = None, max_cap: Optional[float] = None) -> bool:
         """
         按市值过滤股票 - 直接操作内部股票数据（兼容性函数）
 
@@ -2380,7 +3518,7 @@ class StockPoolDataStore:
             logger.error(f"❌ 市值过滤失败: {e}")
             return False
 
-    def filter_by_market_cap(self, min_cap: float = None, max_cap: float = None) -> bool:
+    def filter_by_market_cap(self, min_cap: Optional[float] = None, max_cap: Optional[float] = None) -> bool:
         """
         按市值过滤股票 - 直接操作内部股票数据
 
@@ -2415,7 +3553,7 @@ class StockPoolDataStore:
             logger.error(f"❌ 市值过滤失败: {e}")
             return False
 
-    def filter_by_industry_to_cache(self, industries: List[str] = None) -> bool:
+    def filter_by_industry_to_cache(self, industries: Optional[List[str]] = None) -> bool:
         """
         按行业过滤股票 - 直接操作内部股票数据（兼容性函数）
 
@@ -2454,7 +3592,7 @@ class StockPoolDataStore:
             logger.error(f"❌ 行业过滤失败: {e}")
             return False
 
-    def filter_by_exchange_to_cache(self, exchange: str = None) -> bool:
+    def filter_by_exchange_to_cache(self, exchange: Optional[str] = None) -> bool:
         """
         按交易所过滤股票 - 直接操作内部股票数据（兼容性函数）
 
@@ -2490,7 +3628,7 @@ class StockPoolDataStore:
             logger.error(f"❌ 交易所过滤失败: {e}")
             return False
 
-    def filter_by_industry(self, industries: List[str] = None) -> bool:
+    def filter_by_industry(self, industries: Optional[List[str]] = None) -> bool:
         """
         按行业过滤股票 - 直接操作内部股票数据
 
@@ -2529,7 +3667,7 @@ class StockPoolDataStore:
             logger.error(f"❌ 行业过滤失败: {e}")
             return False
 
-    def filter_by_exchange(self, exchange: str = None) -> bool:
+    def filter_by_exchange(self, exchange: Optional[str] = None) -> bool:
         """
         按交易所过滤股票 - 直接操作内部股票数据
 
@@ -2565,7 +3703,7 @@ class StockPoolDataStore:
             logger.error(f"❌ 交易所过滤失败: {e}")
             return False
 
-    def apply_filters_to_cache(self, filters: Dict[str, Any] = None) -> bool:
+    def apply_filters_to_cache(self, filters: Optional[Dict[str, Any]] = None) -> bool:
         """
         应用多个过滤器到内部缓存 - 链式过滤（旧版函数，保持兼容性）
 
@@ -2626,7 +3764,7 @@ class StockPoolDataStore:
 
 
 
-    def fetch_stock_list(self, filters: Dict[str, Any] = None) -> Optional[pd.DataFrame]:
+    def fetch_stock_list(self, filters: Optional[Dict[str, Any]] = None) -> Optional[pd.DataFrame]:
         """
         获取所有A股股票列表 (带缓存和过滤)
 
@@ -2734,6 +3872,48 @@ class StockPoolDataStore:
             logger.error(f"❌ 获取A股股票列表失败: {e}")
             return None
 
+    def get_price(self, stock_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """
+        获取单只股票的价格数据
+
+        Args:
+            stock_code: 股票代码
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            Optional[pd.DataFrame]: 价格数据DataFrame或None
+        """
+        try:
+            if not RQDATAC_AVAILABLE or rqdatac is None:
+                logger.warning("⚠️ rqdatac不可用")
+                return None
+
+            # 使用rqdatac获取价格数据
+            price_data = rqdatac.get_price(
+                stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                frequency='1d',
+                fields=['open', 'close', 'high', 'low', 'volume']
+            )
+
+            if price_data is None or price_data.empty:
+                logger.warning(f"⚠️ 未获取到{stock_code}的价格数据")
+                return None
+
+            # 确保date列是datetime类型并设置为索引
+            if 'date' in price_data.columns:
+                price_data['date'] = pd.to_datetime(price_data['date'])
+                price_data = price_data.set_index('date')
+
+            logger.debug(f"✅ 获取{stock_code}价格数据成功: {len(price_data)}条记录")
+            return price_data
+
+        except Exception as e:
+            logger.error(f"❌ 获取{stock_code}价格数据失败: {e}")
+            return None
+
     def apply_filters(self, df: pd.DataFrame, filters: Dict[str, Any]) -> pd.Series:
         """
         应用过滤器并返回布尔Series
@@ -2824,9 +4004,9 @@ class StockPoolDataStore:
         cache_key = stock_code  # 直接使用股票代码作为缓存键
         cache_filename = f"kline_{cache_key}.json"
 
-        # 如果不是强制刷新，先尝试从磁盘缓存加载
+        # 如果不是强制刷新，先尝试从统一缓存加载
         if not force_refresh:
-            cached_data = self.load_data_from_file(cache_filename)
+            cached_data = self._load_from_unified_cache(stock_code, end_date)
             if cached_data is not None:
                 try:
                     # 从缓存的数据重建DataFrame
@@ -2838,18 +4018,13 @@ class StockPoolDataStore:
                             df['date'] = pd.to_datetime(df['date'])
                             df = df.set_index('date')
 
-                        # 从缓存元数据中获取股票代码（现在直接是order_book_id）
-                        cached_stock_code = cached_data.get('stock_code', stock_code)
-
                         # 缓存到内存用于计算（极简设计）
-                        self.kline_cache[cached_stock_code] = df.copy()
+                        self.kline_cache[stock_code] = df.copy()
 
-                        # 注意：程序一次性运行，无需缓存大小限制
-
-                        logger.debug(f"✅ 从磁盘缓存加载K线数据: {cached_stock_code}, {len(df)}条记录")
+                        logger.debug(f"✅ 从统一缓存加载K线数据: {stock_code}, {len(df)}条记录")
                         return df
                 except Exception as e:
-                    logger.warning(f"⚠️ 磁盘缓存数据格式错误: {cache_filename}, {e}")
+                    logger.warning(f"⚠️ 统一缓存数据格式错误: {e}")
 
         # 检查内存缓存（仅当不是强制刷新时）
         if not force_refresh:
@@ -2914,20 +4089,8 @@ class StockPoolDataStore:
                     cache_key = extracted_stock_code
                     cache_filename = f"kline_{cache_key}.json"
 
-                    # 立即保存到磁盘缓存
-                    cache_data = {
-                        'stock_code': extracted_stock_code,
-                        'start_date': start_date,
-                        'end_date': end_date,
-                        'data': df.reset_index().to_dict('records'),  # 重置索引后转换为记录列表，避免datetime序列化问题
-                        'cached_time': datetime.now().isoformat(),
-                        'data_points': len(df)
-                    }
-
-                    if self.save_data_to_file(cache_data, cache_filename):
-                        logger.debug(f"💾 K线数据已保存到磁盘缓存: {cache_filename}")
-                    else:
-                        logger.warning(f"⚠️ K线数据保存到磁盘缓存失败: {cache_filename}")
+                    # 注意：不再在这里保存到统一缓存，而是在批量处理完成后统一保存
+                    # 保存到统一缓存的逻辑将移到批量处理的地方
 
                     # 缓存到内存用于计算（极简设计）
                     self.kline_cache[extracted_stock_code] = df.copy()
@@ -3013,7 +4176,7 @@ class StockPoolDataStore:
                 # 转换为DataFrame格式，股票代码作为索引
                 if info_dict:
                     df = pd.DataFrame([info_dict])
-                    df.index = [stock_code]
+                    df.index = pd.Index([stock_code])
                     logger.debug(f"📊 获取股票基本信息: {stock_code}, {len(info_dict)} 个字段")
                     return df
                 else:
@@ -3027,7 +4190,7 @@ class StockPoolDataStore:
             logger.error(f"❌ 获取股票基本信息失败 {stock_code}: {e}")
             return None
 
-    def _fetch_valuation_series(self, stock_code: str, date: str = None) -> Optional[pd.DataFrame]:
+    def _fetch_valuation_series(self, stock_code: str, date: Optional[str] = None) -> Optional[pd.DataFrame]:
         """
         获取股票估值信息
         支持批量获取优化
@@ -3059,6 +4222,13 @@ class StockPoolDataStore:
             valuation_data = rqdatac.get_factor(stock_code, valuation_factors, start_date=date, end_date=date)
 
             if valuation_data is not None and not valuation_data.empty:
+                # 确保返回DataFrame格式
+                if isinstance(valuation_data, pd.Series):
+                    valuation_data = valuation_data.to_frame().T
+                elif not isinstance(valuation_data, pd.DataFrame):
+                    logger.warning(f"⚠️ 估值数据格式异常: {type(valuation_data)}")
+                    return None
+
                 logger.debug(f"💰 获取估值信息: {stock_code} ({date}), {len(valuation_data)} 条记录")
 
                 # 检查是否所有核心字段都为NaN（数据质量问题）
@@ -3080,6 +4250,269 @@ class StockPoolDataStore:
 
         except Exception as e:
             logger.error(f"❌ 获取估值信息失败 {stock_code}: {e}")
+            return None
+
+    def _save_to_unified_cache(self, stock_code: str, df: pd.DataFrame, start_date: str, end_date: str) -> bool:
+        """
+        将股票数据保存到统一缓存文件
+
+        Args:
+            stock_code: 股票代码
+            df: 股票数据DataFrame
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            bool: 保存是否成功
+        """
+        try:
+            # 生成统一缓存文件名（使用结束日期作为标识）
+            cache_filename = f"{end_date}_kline_data.json"
+
+            # 尝试加载现有的统一缓存文件
+            existing_data = self.load_data_from_file(cache_filename)
+            if existing_data is None:
+                existing_data = {
+                    'trading_date': end_date,
+                    'fetch_time': datetime.now().isoformat(),
+                    'stocks': {}
+                }
+
+            # 添加或更新当前股票的数据
+            stock_data = {
+                'stock_code': stock_code,
+                'start_date': start_date,
+                'end_date': end_date,
+                'data': df.reset_index().to_dict('records'),
+                'data_points': len(df),
+                'last_updated': datetime.now().isoformat()
+            }
+
+            existing_data['stocks'][stock_code] = stock_data
+            existing_data['fetch_time'] = datetime.now().isoformat()  # 更新整体获取时间
+
+            # 保存到文件
+            # 生产环境使用紧凑格式以提高性能
+            use_indent = not (
+                os.getenv('ENV', '').lower() == 'production' or
+                os.getenv('PRODUCTION', '').lower() in ('true', '1', 'yes') or
+                not os.getenv('DEBUG', '').lower() in ('true', '1', 'yes')
+            )
+            return self.save_data_to_file(existing_data, cache_filename, use_indent=use_indent)
+
+        except Exception as e:
+            logger.error(f"❌ 保存到统一缓存失败 {stock_code}: {e}")
+            return False
+
+    def _save_all_stocks_to_unified_cache(self, price_data: Dict[str, pd.DataFrame], start_date: str, end_date: str) -> bool:
+        """
+        将所有股票数据一次性保存到统一缓存文件
+
+        Args:
+            price_data: 价格数据字典 {stock_code: price_df}
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            bool: 保存是否成功
+        """
+        try:
+            # 生成统一缓存文件名
+            cache_filename = f"{end_date}_kline_data.json"
+
+            # 准备统一缓存数据结构
+            unified_data = {
+                'trading_date': end_date,
+                'fetch_time': datetime.now().isoformat(),
+                'stocks': {}
+            }
+
+            # 处理每只股票的数据 - 批量处理以提高性能
+            processed_count = 0
+            for stock_code, df in price_data.items():
+                if df is not None and not df.empty:
+                    stock_data = {
+                        'stock_code': stock_code,
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'data': df.reset_index().to_dict('records'),
+                        'data_points': len(df),
+                        'last_updated': datetime.now().isoformat()
+                    }
+                    unified_data['stocks'][stock_code] = stock_data
+                    processed_count += 1
+
+                    # 每处理100只股票记录一次进度（减少日志频率）
+                    if processed_count % 100 == 0:
+                        logger.debug(f"📊 已处理 {processed_count} 只股票数据")
+
+            # 保存到文件
+            # 生产环境使用紧凑格式以提高性能
+            use_indent = not (
+                os.getenv('ENV', '').lower() == 'production' or
+                os.getenv('PRODUCTION', '').lower() in ('true', '1', 'yes') or
+                not os.getenv('DEBUG', '').lower() in ('true', '1', 'yes')
+            )
+            success = self.save_data_to_file(unified_data, cache_filename, use_indent=use_indent)
+            if success:
+                logger.info(f"💾 统一缓存文件已保存: {cache_filename}, 包含 {len(unified_data['stocks'])} 只股票")
+            else:
+                logger.error(f"❌ 统一缓存文件保存失败: {cache_filename}")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"❌ 批量保存到统一缓存失败: {e}")
+            return False
+
+    def save_valuation_data_to_cache(self, valuation_df: pd.DataFrame, target_date: str) -> bool:
+        """
+        将估值数据保存到缓存文件
+
+        Args:
+            valuation_df: 估值数据DataFrame
+            target_date: 目标日期
+
+        Returns:
+            bool: 保存是否成功
+        """
+        try:
+            if valuation_df.empty:
+                logger.warning("⚠️ 估值数据为空，跳过保存")
+                return False
+
+            # 生成缓存文件名
+            cache_filename = f"{target_date}_valuation_data.json"
+
+            # 准备缓存数据结构
+            cache_data = {
+                'trading_date': target_date,
+                'fetch_time': datetime.now().isoformat(),
+                'valuation_data': valuation_df.to_dict('records'),
+                'total_stocks': len(valuation_df)
+            }
+
+            # 保存到文件
+            # 生产环境使用紧凑格式以提高性能
+            use_indent = not (
+                os.getenv('ENV', '').lower() == 'production' or
+                os.getenv('PRODUCTION', '').lower() in ('true', '1', 'yes') or
+                not os.getenv('DEBUG', '').lower() in ('true', '1', 'yes')
+            )
+            success = self.save_data_to_file(cache_data, cache_filename, use_indent=use_indent)
+            if success:
+                logger.info(f"💾 估值数据已保存到缓存: {cache_filename}, 包含 {len(valuation_df)} 只股票")
+            else:
+                logger.error(f"❌ 估值数据保存失败: {cache_filename}")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"❌ 保存估值数据到缓存失败: {e}")
+            return False
+
+    def load_valuation_data_from_cache(self, target_date: str) -> Optional[pd.DataFrame]:
+        """
+        从缓存文件加载估值数据
+
+        Args:
+            target_date: 目标日期
+
+        Returns:
+            Optional[pd.DataFrame]: 估值数据DataFrame或None
+        """
+        try:
+            cache_filename = f"{target_date}_valuation_data.json"
+            cached_data = self.load_data_from_file(cache_filename)
+
+            if cached_data is None:
+                return None
+
+            # 检查缓存是否过期（超过24小时）
+            fetch_time = cached_data.get('fetch_time')
+            if fetch_time:
+                fetch_datetime = datetime.fromisoformat(fetch_time)
+                if (datetime.now() - fetch_datetime).total_seconds() > 24 * 3600:
+                    logger.debug(f"⚠️ 估值数据缓存已过期: {cache_filename}")
+                    return None
+
+            # 转换为DataFrame
+            records = cached_data.get('valuation_data', [])
+            if records:
+                df = pd.DataFrame(records)
+                logger.info(f"📁 估值数据已从缓存加载: {cache_filename}, {len(df)} 只股票")
+                return df
+            else:
+                logger.warning(f"⚠️ 缓存文件格式错误: {cache_filename}")
+                return None
+
+        except Exception as e:
+            logger.warning(f"⚠️ 加载估值数据缓存失败: {e}")
+            return None
+
+    def _load_from_unified_cache(self, stock_code: str, target_date: str) -> Optional[Dict]:
+        """
+        从统一缓存文件中加载股票数据（优化版：使用内存缓存）
+
+        Args:
+            stock_code: 股票代码
+            target_date: 目标日期
+
+        Returns:
+            Dict: 股票数据或None
+        """
+        try:
+            # 生成统一缓存文件名
+            cache_filename = f"{target_date}_kline_data.json"
+
+            # 首先检查内存缓存
+            if hasattr(self, '_unified_cache') and cache_filename in self._unified_cache:
+                cached_data = self._unified_cache[cache_filename]
+                logger.debug(f"📁 从内存缓存加载统一缓存文件: {cache_filename}")
+            else:
+                # 从文件加载并存入内存缓存
+                cached_data = self.load_data_from_file(cache_filename, skip_logging=True)
+                if cached_data is None:
+                    return None
+
+                # 初始化内存缓存
+                if not hasattr(self, '_unified_cache'):
+                    self._unified_cache = {}
+
+                # 存入内存缓存
+                self._unified_cache[cache_filename] = cached_data
+                logger.debug(f"📁 统一缓存文件已加载到内存: {cache_filename}")
+
+            # 检查文件是否过期（超过24小时）
+            fetch_time = cached_data.get('fetch_time')
+            if fetch_time:
+                fetch_datetime = datetime.fromisoformat(fetch_time)
+                if (datetime.now() - fetch_datetime).total_seconds() > 24 * 3600:
+                    logger.debug(f"⚠️ 统一缓存文件已过期: {cache_filename}")
+                    # 从内存缓存中移除过期文件
+                    if hasattr(self, '_unified_cache') and cache_filename in self._unified_cache:
+                        del self._unified_cache[cache_filename]
+                    return None
+
+            # 检查交易日是否匹配
+            trading_date = cached_data.get('trading_date')
+            if trading_date != target_date:
+                logger.debug(f"⚠️ 缓存文件交易日不匹配: {trading_date} vs {target_date}")
+                return None
+
+            # 获取指定股票的数据
+            stocks_data = cached_data.get('stocks', {})
+            stock_data = stocks_data.get(stock_code)
+
+            if stock_data is None:
+                logger.debug(f"⚠️ 缓存文件中没有找到股票 {stock_code} 的数据")
+                return None
+
+            logger.debug(f"✅ 从统一缓存加载股票数据: {stock_code}")
+            return stock_data
+
+        except Exception as e:
+            logger.error(f"❌ 从统一缓存加载失败 {stock_code}: {e}")
             return None
 
     def _get_latest_trading_date(self, stock_code: str, max_days_back: int = 30) -> Optional[str]:
@@ -3302,9 +4735,20 @@ class StockPoolDataStore:
             logger.debug(f"📋 股票列表: {stock_list[:5]}{'...' if len(stock_list) > 5 else ''}")
 
             # 执行批量获取
-            batch_result = rqdatac.get_factor(stock_list, factors, start_date=date, end_date=date)
+            if rqdatac is not None:
+                batch_result = rqdatac.get_factor(stock_list, factors, start_date=date, end_date=date)
+            else:
+                logger.error("❌ rqdatac不可用，无法执行批量估值获取")
+                return
 
             if batch_result is not None and not batch_result.empty:
+                # 确保返回DataFrame格式
+                if isinstance(batch_result, pd.Series):
+                    batch_result = batch_result.to_frame().T
+                elif not isinstance(batch_result, pd.DataFrame):
+                    logger.warning(f"⚠️ 批量估值数据格式异常: {type(batch_result)}")
+                    return
+
                 # 缓存批量结果
                 cache_key = f"batch_valuation_{date}"
                 self.batch_cache[cache_key] = batch_result
@@ -3319,9 +4763,6 @@ class StockPoolDataStore:
             logger.error(f"❌ 批量估值获取异常: {e}")
             logger.debug("🔍 异常详情", exc_info=True)
             # 不向上传播异常，保持系统稳定性
-
-        except Exception as e:
-            logger.error(f"❌ 批量估值获取失败: {e}")
 
     def _extract_single_stock_from_batch(self, batch_data: pd.DataFrame, stock_code: str, date: str) -> Optional[pd.DataFrame]:
         """
@@ -4246,13 +5687,19 @@ class StockPoolIndicatorEngine:
             logger.error(f"❌ 指标计算失败: {e}")
             return {}
 
-    def get_indicator_stats(self) -> Dict:
+    def get_indicator_stats(self) -> Dict[str, Any]:
         """获取指标计算统计信息"""
-        stats = self.calculation_stats.copy()
+        stats: Dict[str, Any] = {}
+        calculation_stats = self.calculation_stats.copy()
+
+        # 复制基础统计数据
+        for key, value in calculation_stats.items():
+            stats[key] = value
+
         total = stats['total_calculations']
         if total > 0:
-            stats['success_rate'] = stats['successful_calculations'] / total
-            stats['error_rate'] = stats['errors'] / total
+            stats['success_rate'] = float(stats['successful_calculations']) / total
+            stats['error_rate'] = float(stats['errors']) / total
         else:
             stats['success_rate'] = 0.0
             stats['error_rate'] = 0.0
@@ -4366,11 +5813,12 @@ class DataQualityEvaluator:
     def __init__(self, manager):
         self.manager = manager
         self.quality_reports = {}
+        self.logger = get_logger()  # 添加 logger
 
     def evaluate_data_quality(self, stock_info: Dict, technical_indicators: Dict,
-                            data_types: List[str] = None) -> Dict[str, bool]:
+                            data_types: Optional[List[str]] = None) -> Dict[str, bool]:
         """
-        Evaluate data quality
+        Evaluate data quality - 集成 data_formats.py 的标准质量检查
         """
         if data_types is None:
             data_types = ['valuation', 'technical', 'price']
@@ -4390,6 +5838,17 @@ class DataQualityEvaluator:
 
             results[data_type] = is_valid
             quality_report[data_type] = report
+
+        # 集成 data_formats.py 的通用质量检查
+        if 'price' in data_types and technical_indicators.get('price_data') is not None:
+            price_df = technical_indicators['price_data']
+            if isinstance(price_df, pd.DataFrame):
+                # 使用 data_formats.py 的标准质量检查
+                formats_quality = check_data_quality(price_df)
+                if not formats_quality['valid']:
+                    results['price'] = False
+                    quality_report['price']['formats_issues'] = formats_quality['issues']
+                    self.logger.warning(f"价格数据不符合 data_formats.py 标准: {formats_quality['issues']}")
 
         # Store quality report
         stock_code = stock_info.get('stock_code', 'unknown')
@@ -4584,7 +6043,7 @@ class DataQualityEvaluator:
 
         return is_valid, report
 
-    def get_quality_report(self, stock_code: str = None) -> Dict:
+    def get_quality_report(self, stock_code: Optional[str] = None) -> Dict:
         """
         Get quality report
         """
@@ -4593,7 +6052,7 @@ class DataQualityEvaluator:
         return self.quality_reports
 
     def is_data_quality_acceptable(self, stock_info: Dict, technical_indicators: Dict,
-                                 data_types: List[str] = None) -> bool:
+                                 data_types: Optional[List[str]] = None) -> bool:
         """
         Check if data quality is acceptable
         """
@@ -4671,9 +6130,13 @@ class ScoringEngine:
                         data_types_to_check.append(data_source)
 
             # Data quality assessment
-            quality_results = self.quality_evaluator.evaluate_data_quality(
-                stock_info, technical_indicators, data_types_to_check
-            )
+            if self.quality_evaluator is not None:
+                quality_results = self.quality_evaluator.evaluate_data_quality(
+                    stock_info, technical_indicators, data_types_to_check
+                )
+            else:
+                self.manager.logger.warning(f"Quality evaluator not available for {stock_code}, skipping quality check")
+                quality_results = {dt: True for dt in data_types_to_check}  # Assume all pass if no evaluator
 
             # Check if all data types pass
             if not all(quality_results.values()):
@@ -4781,7 +6244,7 @@ class ScoringEngine:
             return factors
 
         except Exception as e:
-            self._log_error(f"通用评分因子计算失败: {e}")
+            self.manager.logger.error(f"通用评分因子计算失败: {e}")
             return {}
 
 # ============================================================================

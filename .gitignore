@@ -67,7 +67,7 @@ backup/
 !modules/data_manager.py.backup  # 保留数据管理器备份
 
 # Test directories (if they exist)
-test/
+# test/  # 暂时注释掉，允许提交测试文件
 tools/
 
 # Other temporary files

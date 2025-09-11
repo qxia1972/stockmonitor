@@ -26,7 +26,8 @@ from .data_formats import (
     EXTENDED_MARKET_COLUMNS,
     STANDARD_INDICATOR_COLUMNS,
     get_indicator_config,
-    validate_kline_dataframe
+    validate_kline_dataframe,
+    validate_indicator_dataframe
 )
 
 # 标准字段定义
@@ -251,6 +252,18 @@ class UnifiedIndicatorEngine:
                 print(f"❌ {indicator}计算缺少必需列: {missing_cols}")
                 return None
 
+            # 验证数据质量
+            if not validate_kline_dataframe(data):
+                print(f"⚠️ {indicator}计算数据质量不符合标准格式")
+                # 尝试标准化数据
+                try:
+                    from .data_formats import standardize_kline_dataframe
+                    data = standardize_kline_dataframe(data)
+                    print(f"✅ 数据已标准化")
+                except Exception as e:
+                    print(f"❌ 数据标准化失败: {e}")
+                    return None
+
             # 合并参数
             calc_params = indicator_info['default_params'].copy()
             calc_params.update(params)
@@ -260,6 +273,19 @@ class UnifiedIndicatorEngine:
 
             if result is not None:
                 self._calculation_count += 1
+
+                # 验证指标结果格式
+                if isinstance(result, pd.Series):
+                    # 单值指标验证
+                    if not validate_indicator_dataframe(pd.DataFrame({indicator: result}), indicator):
+                        print(f"⚠️ {indicator}结果格式不符合标准")
+                elif isinstance(result, dict):
+                    # 多值指标验证
+                    result_df = pd.DataFrame(result)
+                    for col in result_df.columns:
+                        if col in STANDARD_INDICATOR_COLUMNS:
+                            if not validate_indicator_dataframe(result_df[[col]], col):
+                                print(f"⚠️ {indicator}结果列{col}格式不符合标准")
 
                 # 如果请求了特定数量，截取结果
                 if count is not None and count > 0:
