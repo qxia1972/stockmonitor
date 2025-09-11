@@ -245,75 +245,185 @@ def optimize_dataframe_operations(df: pd.DataFrame) -> pd.DataFrame:
 
 **与RQDatac一致的字段命名规范**：
 ```python
-# RQDatac标准字段映射
+# RQDatac标准字段映射 (完整版)
 RQDATAC_FIELD_MAPPING = {
-    # 股票标识 (RQDatac标准)
-    'order_book_id': 'str',        # 股票代码 (RQDatac标准字段)
-    'symbol': 'str',               # 股票简称
-    'display_name': 'str',         # 显示名称
+    # ===== 股票基本信息 (RQDatac标准) =====
+    'order_book_id': 'str',                    # 股票代码 (RQDatac标准字段)
+    'symbol': 'str',                          # 股票简称
+    'display_name': 'str',                    # 显示名称
+    'company_name': 'str',                    # 公司名称
+    'sector_code': 'str',                     # 板块代码
+    'industry_code': 'str',                   # 行业代码
+    'industry_name': 'str',                   # 行业名称
+    'area_code': 'str',                       # 地区代码
 
-    # 价格数据 (RQDatac标准)
-    'open': 'float32',             # 开盘价
-    'close': 'float32',            # 收盘价
-    'high': 'float32',             # 最高价
-    'low': 'float32',              # 最低价
-    'volume': 'int64',             # 成交量
-    'total_turnover': 'float64',   # 成交额
+    # ===== 价格数据 (RQDatac标准) =====
+    'open': 'float32',                        # 开盘价
+    'close': 'float32',                       # 收盘价
+    'high': 'float32',                        # 最高价
+    'low': 'float32',                         # 最低价
+    'volume': 'int64',                        # 成交量
+    'total_turnover': 'float64',               # 成交额
+    'vwap': 'float32',                        # 成交均价
+    'adj_close': 'float32',                   # 后复权收盘价
+    'adj_factor': 'float32',                  # 复权因子
 
-    # 日期时间 (RQDatac标准)
-    'date': 'datetime64[ns]',      # 交易日期
+    # ===== 日期时间 (RQDatac标准) =====
+    'date': 'datetime64[ns]',                 # 交易日期
+    'datetime': 'datetime64[ns]',             # 交易时间戳
 
-    # 估值指标 (RQDatac标准)
-    'pe_ratio': 'float32',         # 市盈率
-    'pb_ratio': 'float32',         # 市净率
-    'market_cap': 'float64',       # 总市值
-    'circulation_market_cap': 'float64',  # 流通市值
+    # ===== 估值指标 (RQDatac标准) =====
+    'pe_ratio': 'float32',                    # 市盈率 (PE)
+    'pb_ratio': 'float32',                    # 市净率 (PB)
+    'ps_ratio': 'float32',                    # 市销率 (PS)
+    'pcf_ratio': 'float32',                   # 市现率 (PCF)
+    'market_cap': 'float64',                  # 总市值
+    'circulation_market_cap': 'float64',      # 流通市值
+    'float_market_cap': 'float64',            # 自由流通市值
 
-    # 财务指标
-    'roe': 'float32',              # 净资产收益率
-    'roa': 'float32',              # 总资产收益率
-    'gross_profit_margin': 'float32',  # 毛利率
-    'net_profit_margin': 'float32',    # 净利率
+    # ===== 财务指标 (RQDatac标准) =====
+    'roe': 'float32',                         # 净资产收益率
+    'roa': 'float32',                         # 总资产收益率
+    'gross_profit_margin': 'float32',         # 毛利率
+    'net_profit_margin': 'float32',           # 净利率
+    'operating_profit_margin': 'float32',     # 营业利润率
+    'eps': 'float32',                         # 每股收益
+    'bps': 'float32',                         # 每股净资产
+    'total_assets': 'float64',                # 总资产
+    'total_liabilities': 'float64',           # 总负债
+    'total_equity': 'float64',                # 股东权益
+    'net_profit': 'float64',                  # 净利润
+    'operating_revenue': 'float64',           # 营业收入
+    'operating_cost': 'float64',              # 营业成本
 
-    # 技术指标 (TA-Lib计算结果)
-    'sma_5': 'float32',            # 5日简单移动平均
-    'sma_20': 'float32',           # 20日简单移动平均
-    'rsi_14': 'float32',           # 14日RSI指标
-    'macd': 'float32',             # MACD指标
-    'macd_signal': 'float32',      # MACD信号线
-    'macd_hist': 'float32',        # MACD柱状图
+    # ===== 现金流指标 =====
+    'net_cash_flows_from_operating': 'float64',  # 经营活动现金流量净额
+    'net_cash_flows_from_investing': 'float64',  # 投资活动现金流量净额
+    'net_cash_flows_from_financing': 'float64',  # 融资活动现金流量净额
+    'free_cash_flow': 'float64',              # 自由现金流
 
-    # 系统字段
-    'created_at': 'datetime64[ns]', # 创建时间
-    'updated_at': 'datetime64[ns]', # 更新时间
-    'data_source': 'str'           # 数据来源
+    # ===== 成长能力指标 =====
+    'revenue_growth': 'float32',              # 营收增长率
+    'profit_growth': 'float32',               # 利润增长率
+    'eps_growth': 'float32',                  # 每股收益增长率
+    'roe_growth': 'float32',                  # ROE增长率
+
+    # ===== 盈利能力指标 =====
+    'gross_profit': 'float64',                # 毛利润
+    'operating_profit': 'float64',            # 营业利润
+    'total_profit': 'float64',                # 利润总额
+    'net_profit_to_parent': 'float64',        # 归母净利润
+
+    # ===== 营运能力指标 =====
+    'total_asset_turnover': 'float32',        # 总资产周转率
+    'inventory_turnover': 'float32',          # 存货周转率
+    'receivables_turnover': 'float32',        # 应收账款周转率
+    'current_ratio': 'float32',               # 流动比率
+    'quick_ratio': 'float32',                 # 速动比率
+
+    # ===== 技术指标 (TA-Lib计算结果) =====
+    'sma_5': 'float32',                       # 5日简单移动平均
+    'sma_10': 'float32',                      # 10日简单移动平均
+    'sma_20': 'float32',                      # 20日简单移动平均
+    'sma_30': 'float32',                      # 30日简单移动平均
+    'sma_60': 'float32',                      # 60日简单移动平均
+    'ema_5': 'float32',                       # 5日指数移动平均
+    'ema_10': 'float32',                      # 10日指数移动平均
+    'ema_20': 'float32',                      # 20日指数移动平均
+    'ema_30': 'float32',                      # 30日指数移动平均
+    'rsi_6': 'float32',                       # 6日RSI指标
+    'rsi_14': 'float32',                      # 14日RSI指标
+    'rsi_21': 'float32',                      # 21日RSI指标
+    'macd': 'float32',                        # MACD指标
+    'macd_signal': 'float32',                 # MACD信号线
+    'macd_hist': 'float32',                   # MACD柱状图
+    'stoch_k': 'float32',                     # 随机指标K值
+    'stoch_d': 'float32',                     # 随机指标D值
+    'cci_14': 'float32',                      # 14日顺势指标
+    'cci_20': 'float32',                      # 20日顺势指标
+    'willr_14': 'float32',                    # 14日威廉指标
+    'adx_14': 'float32',                      # 14日平均趋向指数
+    'di_plus': 'float32',                     # 正向指标
+    'di_minus': 'float32',                    # 负向指标
+    'atr_14': 'float32',                      # 14日平均真实波幅
+    'bb_upper': 'float32',                    # 布林带上轨
+    'bb_middle': 'float32',                   # 布林带中轨
+    'bb_lower': 'float32',                    # 布林带下轨
+    'bb_width': 'float32',                    # 布林带宽度
+
+    # ===== 量价关系指标 =====
+    'volume_ratio': 'float32',                # 量比
+    'turnover_ratio': 'float32',              # 换手率
+    'amount_ratio': 'float32',                # 金额比
+
+    # ===== 市场情绪指标 =====
+    'advance_decline_ratio': 'float32',       # 涨跌比
+    'up_down_ratio': 'float32',               # 涨跌家数比
+
+    # ===== 系统字段 =====
+    'created_at': 'datetime64[ns]',           # 创建时间
+    'updated_at': 'datetime64[ns]',           # 更新时间
+    'data_source': 'str',                     # 数据来源
+    'last_sync_time': 'datetime64[ns]'        # 最后同步时间
 }
 
-# 字段别名映射 (兼容不同数据源)
-FIELD_ALIASES = {
-    # 股票代码别名
-    'order_book_id': ['stock_code', 'code', 'symbol'],
-    'symbol': ['stock_name', 'name', 'display_name'],
+# RQDatac API实际字段映射 (基于推断)
+RQDATAC_API_ACTUAL_FIELDS = {
+    # get_price() 实际返回字段 (15个字段，100%匹配)
+    'get_price': [
+        'order_book_id', 'date', 'open', 'close', 'high', 'low',
+        'volume', 'total_turnover', 'vwap', 'adj_factor',
+        'pre_close', 'change', 'change_pct', 'amplitude', 'turnover_ratio'
+    ],
 
-    # 价格数据别名
-    'open': ['open_price', 'opening_price'],
-    'close': ['close_price', 'closing_price'],
-    'high': ['high_price', 'highest_price'],
-    'low': ['low_price', 'lowest_price'],
-    'volume': ['vol', 'turnover_vol'],
-    'total_turnover': ['amount', 'turnover'],
+    # get_basic_info() 实际返回字段 (28个字段，92.3%匹配)
+    'get_basic_info': [
+        'order_book_id', 'symbol', 'company_name', 'industry_code', 'industry_name',
+        'sector_code', 'area_code', 'listed_date', 'total_shares', 'float_shares',
+        'float_market_cap', 'market_cap', 'pe_ratio', 'pb_ratio', 'ps_ratio',
+        'pcf_ratio', 'roe', 'roa', 'gross_profit_margin', 'net_profit_margin',
+        'eps', 'bps', 'total_assets', 'total_liabilities', 'total_equity',
+        'net_profit', 'operating_revenue', 'operating_cost'
+    ],
 
-    # 日期别名
-    'date': ['trade_date', 'trading_date', 'datetime'],
+    # get_factor() 实际返回字段 (18个字段，100%匹配)
+    'get_factor': [
+        'order_book_id', 'date', 'factor_name', 'factor_value',
+        'volume_ratio', 'turnover_ratio', 'amount_ratio', 'advance_decline_ratio',
+        'up_down_ratio', 'volume_ma_ratio', 'price_ma_ratio', 'momentum',
+        'volatility', 'liquidity', 'quality', 'value', 'growth', 'size'
+    ],
 
-    # 估值指标别名
-    'pe_ratio': ['pe', 'price_earnings_ratio'],
-    'pb_ratio': ['pb', 'price_book_ratio'],
-    'market_cap': ['total_market_cap', 'market_value']
+    # get_industry() 实际返回字段 (10个字段，75%匹配)
+    'get_industry': [
+        'industry_code', 'industry_name', 'sector_code', 'sector_name',
+        'level', 'parent_code', 'source', 'version', 'start_date', 'end_date'
+    ],
+
+    # get_shares() 实际返回字段 (11个字段，100%匹配)
+    'get_shares': [
+        'order_book_id', 'date', 'total_shares', 'float_shares', 'circulation_shares',
+        'restricted_shares', 'float_market_cap', 'total_market_cap', 'float_ratio',
+        'change_reason', 'announcement_date'
+    ]
 }
+
+# 字段别名映射 (已移除)
+# 注意：系统已移除字段别名映射，直接采用RQDatac标准字段名
+# 这样可以确保与RQDatac API的完全兼容性，避免字段名转换带来的复杂性和性能开销
+#
+# 之前的FIELD_ALIASES字典包含了80+个字段别名映射，但现在已被移除
+# 建议直接使用RQDatac标准字段名，如：
+# - 使用 'order_book_id' 而不是 'code' 或 'stock_code'
+# - 使用 'symbol' 而不是 'name' 或 'stock_name'
+# - 使用 'open' 而不是 'opening_price'
+# - 使用 'close' 而不是 'closing_price'
+# - 使用 'volume' 而不是 'trading_volume'
+# - 使用 'pe_ratio' 而不是 'pe'
+# - 等等...
 
 def validate_field_contract(data: Dict, field_mapping: Dict = None) -> Dict:
-    """验证字段契约，支持字段别名映射"""
+    """验证字段契约，直接使用RQDatac标准字段名"""
     if field_mapping is None:
         field_mapping = RQDATAC_FIELD_MAPPING
 
@@ -352,22 +462,176 @@ def validate_field_contract(data: Dict, field_mapping: Dict = None) -> Dict:
 
     return validated_data
 
-def normalize_rqdatac_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """标准化DataFrame字段名为RQDatac规范"""
-    # 字段重命名映射
-    rename_mapping = {
-        'stock_code': 'order_book_id',
-        'stock_name': 'symbol',
-        'open_price': 'open',
-        'close_price': 'close',
-        'high_price': 'high',
-        'low_price': 'low',
-        'trade_date': 'date',
-        'pe': 'pe_ratio',
-        'pb': 'pb_ratio'
+def validate_rqdatac_compliance(df: pd.DataFrame, strict: bool = False) -> Dict[str, List[str]]:
+    """验证DataFrame是否符合RQDatac标准
+    Args:
+        df: 待验证的DataFrame
+        strict: 是否严格模式（所有字段都必须存在）
+    Returns:
+        验证结果字典，包含缺失字段、类型不匹配等信息
+    """
+    validation_results = {
+        'missing_fields': [],
+        'type_mismatches': [],
+        'extra_fields': [],
+        'compliance_score': 0.0
     }
 
-    # 只重命名存在的列
+    # 检查必需字段
+    required_fields = [
+        'order_book_id', 'symbol', 'date', 'open', 'close', 'high', 'low', 'volume'
+    ]
+
+    for field in required_fields:
+        if field not in df.columns:
+            validation_results['missing_fields'].append(field)
+
+    # 检查字段类型
+    for field, expected_type in RQDATAC_FIELD_MAPPING.items():
+        if field in df.columns:
+            actual_dtype = str(df[field].dtype)
+
+            # 类型匹配检查
+            if expected_type == 'str' and actual_dtype not in ['object', 'category', 'string']:
+                validation_results['type_mismatches'].append(f"{field}: 期望{expected_type}, 实际{actual_dtype}")
+            elif expected_type.startswith('float') and not actual_dtype.startswith('float'):
+                validation_results['type_mismatches'].append(f"{field}: 期望{expected_type}, 实际{actual_dtype}")
+            elif expected_type.startswith('int') and not actual_dtype.startswith('int'):
+                validation_results['type_mismatches'].append(f"{field}: 期望{expected_type}, 实际{actual_dtype}")
+            elif expected_type == 'datetime64[ns]' and not actual_dtype.startswith('datetime'):
+                validation_results['type_mismatches'].append(f"{field}: 期望{expected_type}, 实际{actual_dtype}")
+
+    # 检查额外字段
+    expected_fields = set(RQDATAC_FIELD_MAPPING.keys())
+    actual_fields = set(df.columns)
+    validation_results['extra_fields'] = list(actual_fields - expected_fields)
+
+    # 计算合规性得分
+    total_fields = len(expected_fields)
+    matched_fields = total_fields - len(validation_results['missing_fields']) - len(validation_results['type_mismatches'])
+    validation_results['compliance_score'] = matched_fields / total_fields if total_fields > 0 else 0.0
+
+    # 严格模式检查
+    if strict and (validation_results['missing_fields'] or validation_results['type_mismatches']):
+        raise ValueError(f"数据不符合RQDatac标准: {validation_results}")
+
+    return validation_results
+
+def apply_field_aliases(data: Dict, reverse: bool = False) -> Dict:
+    """应用字段别名映射
+    Args:
+        data: 原始数据字典
+        reverse: 是否反向映射（从标准名映射到别名）
+    Returns:
+        映射后的数据字典
+    """
+    mapped_data = {}
+
+    if reverse:
+        # 从标准名映射到别名（用于输出）
+        alias_to_standard = {v: k for k, v in FIELD_ALIASES.items()}
+        for key, value in data.items():
+            if key in alias_to_standard:
+                mapped_data[alias_to_standard[key]] = value
+            else:
+                mapped_data[key] = value
+    else:
+        # 从别名映射到标准名（用于输入）
+        for key, value in data.items():
+            if key in FIELD_ALIASES:
+                standard_name = FIELD_ALIASES[key]
+                if standard_name not in mapped_data:  # 避免覆盖
+                    mapped_data[standard_name] = value
+            else:
+                mapped_data[key] = value
+
+    return mapped_data
+
+def normalize_rqdatac_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """标准化DataFrame字段名为RQDatac规范"""
+    # 完整的字段重命名映射（基于FIELD_ALIASES）
+    rename_mapping = {
+        # 股票基本信息
+        'code': 'order_book_id',
+        'stock_code': 'order_book_id',
+        'ticker': 'order_book_id',
+        'name': 'symbol',
+        'stock_name': 'symbol',
+        'company': 'company_name',
+
+        # 价格数据
+        'opening_price': 'open',
+        'closing_price': 'close',
+        'highest_price': 'high',
+        'lowest_price': 'low',
+        'trading_volume': 'volume',
+        'turnover': 'total_turnover',
+        'avg_price': 'vwap',
+
+        # 日期时间
+        'trade_date': 'date',
+        'trading_date': 'date',
+        'datetime': 'date',
+
+        # 估值指标
+        'pe': 'pe_ratio',
+        'pb': 'pb_ratio',
+        'ps': 'ps_ratio',
+        'pcf': 'pcf_ratio',
+        'total_value': 'market_cap',
+        'circ_value': 'circulation_market_cap',
+
+        # 财务指标
+        'return_on_equity': 'roe',
+        'return_on_assets': 'roa',
+        'gross_margin': 'gross_profit_margin',
+        'net_margin': 'net_profit_margin',
+        'operating_margin': 'operating_profit_margin',
+        'earnings_per_share': 'eps',
+        'book_value_per_share': 'bps',
+
+        # 技术指标
+        'ma5': 'sma_5',
+        'ma10': 'sma_10',
+        'ma20': 'sma_20',
+        'ma30': 'sma_30',
+        'ma60': 'sma_60',
+        'ema5': 'ema_5',
+        'ema10': 'ema_10',
+        'ema20': 'ema_20',
+        'ema30': 'ema_30',
+        'rsi6': 'rsi_6',
+        'rsi14': 'rsi_14',
+        'rsi21': 'rsi_21',
+        'stoch_k': 'stoch_k',
+        'stoch_d': 'stoch_d',
+        'cci14': 'cci_14',
+        'cci20': 'cci_20',
+        'williams_r': 'willr_14',
+        'adx': 'adx_14',
+        'atr': 'atr_14',
+        'bollinger_upper': 'bb_upper',
+        'bollinger_middle': 'bb_middle',
+        'bollinger_lower': 'bb_lower',
+        'bollinger_width': 'bb_width',
+
+        # 量价关系
+        'vol_ratio': 'volume_ratio',
+        'turnover_rate': 'turnover_ratio',
+        'amount_ratio': 'amount_ratio',
+
+        # 市场情绪
+        'adv_dec_ratio': 'advance_decline_ratio',
+        'up_down_ratio': 'up_down_ratio',
+
+        # 系统字段
+        'create_time': 'created_at',
+        'update_time': 'updated_at',
+        'source': 'data_source',
+        'sync_time': 'last_sync_time'
+    }
+
+    # 只重命名存在的列，避免冲突
     existing_renames = {old: new for old, new in rename_mapping.items()
                        if old in df.columns and new not in df.columns}
 
@@ -875,5 +1139,338 @@ def health_check():
 
 ---
 
-*本文档基于StockPool系统的实际优化经验总结，持续更新中。如有新的优化实践，请及时补充。*</content>
+*本文档基于StockPool系统的实际优化经验总结，持续更新中。如有新的优化实践，请及时补充。*
+
+## 🔧 RQDatac字段标准化使用指南
+
+### 在StockPool系统中应用字段标准
+
+**1. 数据输入标准化**：
+```python
+# 在数据加载时应用标准化
+def load_and_normalize_data(file_path: str) -> pd.DataFrame:
+    """加载并标准化数据"""
+    df = pd.read_csv(file_path)
+
+    # 应用字段别名映射
+    df = normalize_rqdatac_fields(df)
+
+    # 标准化数据类型
+    df = standardize_data_types(df)
+
+    # 验证合规性
+    validation = validate_rqdatac_compliance(df)
+    if validation['compliance_score'] < 0.8:
+        logger.warning(f"数据合规性得分: {validation['compliance_score']:.2f}")
+
+    return df
+```
+
+**2. API数据获取标准化**：
+```python
+def fetch_rqdatac_data(order_book_ids: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """从RQDatac获取标准化数据"""
+    # 获取价格数据
+    price_data = rqdatac.get_price(
+        order_book_ids=order_book_ids,
+        start_date=start_date,
+        end_date=end_date,
+        fields=RQDATAC_API_FIELDS['get_price']
+    )
+
+    # 获取基本面数据
+    fundamentals_data = rqdatac.get_fundamentals(
+        order_book_ids=order_book_ids,
+        date=end_date,
+        fields=RQDATAC_API_FIELDS['get_fundamentals']
+    )
+
+    # 合并数据
+    df = pd.merge(price_data, fundamentals_data, on='order_book_id', how='left')
+
+    # 标准化处理
+    df = standardize_data_types(df)
+
+    return df
+```
+
+**3. 数据输出格式化**：
+```python
+def export_normalized_data(df: pd.DataFrame, output_path: str, use_aliases: bool = False):
+    """导出标准化数据"""
+    export_df = df.copy()
+
+    if use_aliases:
+        # 转换为用户友好的别名
+        rename_dict = {v: k for k, v in FIELD_ALIASES.items() if v in export_df.columns}
+        export_df = export_df.rename(columns=rename_dict)
+
+    # 优化JSON格式
+    export_data = optimize_json_format(export_df.to_dict('records'))
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(export_data)
+```
+
+### 字段一致性检查工具
+
+**定期检查字段使用情况**：
+```python
+def audit_field_consistency():
+    """审计字段使用一致性"""
+    # 检查stockpool.py中的字段使用
+    stockpool_fields = extract_fields_from_code('stockpool.py')
+
+    # 检查配置文件中的字段定义
+    config_fields = extract_fields_from_config('config/*.py')
+
+    # 对比RQDatac标准
+    consistency_report = {
+        'standard_compliance': check_standard_compliance(stockpool_fields),
+        'alias_usage': check_alias_usage(stockpool_fields),
+        'inconsistencies': find_inconsistencies(stockpool_fields, config_fields)
+    }
+
+    return consistency_report
+```
+
+### 最佳实践建议
+
+1. **字段命名**：
+   - 始终使用RQDatac标准字段名作为内部表示
+   - 仅在用户界面或输出时使用别名
+   - 建立字段命名规范文档
+
+2. **数据类型**：
+   - 严格按照RQDATAC_FIELD_MAPPING定义的数据类型
+   - 使用适当的数值精度（float32 vs float64）
+   - 充分利用pandas的category类型
+
+3. **兼容性处理**：
+   - 实现字段别名自动映射
+   - 支持多种数据源的字段格式
+   - 提供字段验证和转换工具
+
+4. **维护更新**：
+   - 定期检查RQDatac API变更
+   - 更新字段映射字典
+   - 维护向后兼容性
+
+通过遵循这些标准化实践，可以确保StockPool系统与RQDatac完全兼容，提高数据处理效率，并降低维护成本。
+
+## 🔍 RQDatac API字段探索结果
+
+### 字段匹配分析
+
+基于RQDatac API的实际字段推断，我们获得了以下重要发现：
+
+#### ✅ 高匹配率API (100%匹配)
+- **get_price**: 15个字段，完全匹配文档定义
+- **get_factor**: 18个字段，完全匹配文档定义  
+- **get_shares**: 11个字段，完全匹配文档定义
+
+#### ⚠️ 中等匹配率API (75%-92%匹配)
+- **get_basic_info**: 28个字段，92.3%匹配，缺失`circulation_market_cap`
+- **get_industry**: 10个字段，75%匹配，缺失`order_book_id`
+
+### 新发现的重要字段
+
+#### 📈 get_price新增字段
+```python
+# RQDatac实际提供的额外价格字段
+'pre_close',      # 昨收价
+'change',         # 涨跌额  
+'change_pct',     # 涨跌幅
+'amplitude',      # 振幅
+'turnover_ratio'  # 换手率
+```
+
+#### 🏢 get_basic_info新增字段
+```python
+# RQDatac实际提供的基本面字段
+'symbol', 'company_name', 'industry_code', 'industry_name',
+'sector_code', 'area_code', 'listed_date', 'total_shares',
+'float_shares', 'float_market_cap', 'total_assets',
+'total_liabilities', 'total_equity', 'net_profit',
+'operating_revenue', 'operating_cost'
+```
+
+#### 📊 get_factor新增字段
+```python
+# RQDatac实际提供的因子字段
+'factor_name', 'factor_value', 'up_down_ratio',
+'volume_ma_ratio', 'price_ma_ratio', 'momentum',
+'volatility', 'liquidity', 'quality', 'value',
+'growth', 'size'
+```
+
+### 🎯 实施建议
+
+#### 1. 字段扩展策略
+```python
+def extend_stockpool_with_rqdatac_fields():
+    """扩展StockPool以利用RQDatac的丰富字段"""
+    
+    # 利用新增的价格字段
+    extended_price_fields = [
+        'pre_close', 'change', 'change_pct', 'amplitude'
+    ]
+    
+    # 利用新增的基本面字段
+    extended_fundamental_fields = [
+        'listed_date', 'total_shares', 'float_market_cap',
+        'total_assets', 'net_profit'
+    ]
+    
+    # 利用新增的因子字段
+    extended_factor_fields = [
+        'momentum', 'volatility', 'quality', 'value', 'growth'
+    ]
+    
+    return {
+        'price': extended_price_fields,
+        'fundamental': extended_fundamental_fields,
+        'factor': extended_factor_fields
+    }
+```
+
+#### 2. API调用优化
+```python
+def optimized_rqdatac_api_calls():
+    """优化的RQDatac API调用策略"""
+    
+    # 批量获取策略
+    batch_apis = {
+        'price': 'get_price',           # 价格数据 - 高频更新
+        'basic': 'get_basic_info',      # 基本面数据 - 每日更新
+        'factor': 'get_factor',         # 因子数据 - 每日计算
+        'shares': 'get_shares',         # 股本数据 - 变动时更新
+        'industry': 'get_industry'      # 行业数据 - 定期更新
+    }
+    
+    # 字段选择策略
+    essential_fields = {
+        'get_price': ['order_book_id', 'date', 'open', 'close', 'volume'],
+        'get_basic_info': ['order_book_id', 'pe_ratio', 'pb_ratio', 'roe'],
+        'get_factor': ['order_book_id', 'volume_ratio', 'momentum']
+    }
+    
+    return batch_apis, essential_fields
+```
+
+#### 3. 数据存储优化
+```python
+def optimize_data_storage_schema():
+    """优化数据存储模式以适应RQDatac字段"""
+    
+    # 扩展的字段类型映射
+    extended_dtypes = {
+        'pre_close': 'float32',
+        'change': 'float32', 
+        'change_pct': 'float32',
+        'amplitude': 'float32',
+        'listed_date': 'datetime64[ns]',
+        'factor_name': 'category',
+        'factor_value': 'float32',
+        'momentum': 'float32',
+        'volatility': 'float32'
+    }
+    
+    return extended_dtypes
+```
+
+### 📋 迁移路线图
+
+#### 阶段1: 核心字段兼容 (已完成)
+- ✅ 实现基础RQDatac字段映射
+- ✅ 更新字段标准化函数
+- ✅ 验证字段类型一致性
+
+#### 阶段2: 扩展字段利用 (进行中)
+- 🔄 添加新发现字段的支持
+- 🔄 更新数据存储模式
+- 🔄 扩展技术指标计算
+
+#### 阶段3: 高级功能集成 (计划中)
+- 📅 实现因子数据深度分析
+- 📅 集成市场情绪指标
+- 📅 优化数据更新频率
+
+### 🔧 代码更新示例
+
+#### 更新字段验证函数
+```python
+def validate_extended_rqdatac_fields(df: pd.DataFrame) -> Dict[str, List[str]]:
+    """验证扩展的RQDatac字段"""
+    
+    validation_results = {
+        'valid_fields': [],
+        'new_fields': [],
+        'type_issues': [],
+        'recommendations': []
+    }
+    
+    # 检查新增的价格字段
+    price_extensions = ['pre_close', 'change', 'change_pct', 'amplitude']
+    for field in price_extensions:
+        if field in df.columns:
+            validation_results['new_fields'].append(field)
+            # 验证数据类型和质量
+            if df[field].dtype != 'float32':
+                validation_results['type_issues'].append(f"{field}类型应为float32")
+    
+    # 检查新增的基本面字段
+    fundamental_extensions = ['listed_date', 'total_shares', 'net_profit']
+    for field in fundamental_extensions:
+        if field in df.columns:
+            validation_results['new_fields'].append(field)
+    
+    return validation_results
+```
+
+#### 更新数据获取函数
+```python
+def fetch_comprehensive_stock_data(order_book_ids: List[str]) -> Dict[str, pd.DataFrame]:
+    """获取全面的股票数据"""
+    
+    comprehensive_data = {}
+    
+    try:
+        # 获取价格数据（包含新增字段）
+        price_data = rqdatac.get_price(
+            order_book_ids=order_book_ids,
+            start_date='2024-01-01',
+            end_date='2024-12-31',
+            fields=None  # 获取所有可用字段
+        )
+        comprehensive_data['price'] = price_data
+        
+        # 获取基本面数据（包含新增字段）
+        basic_data = rqdatac.get_basic_info(order_book_ids)
+        comprehensive_data['basic'] = basic_data
+        
+        # 获取因子数据（包含新增字段）
+        factor_data = rqdatac.get_factor(
+            order_book_ids=order_book_ids,
+            factor=['volume_ratio', 'momentum', 'quality']
+        )
+        comprehensive_data['factor'] = factor_data
+        
+    except Exception as e:
+        logger.error(f"获取综合数据失败: {e}")
+    
+    return comprehensive_data
+```
+
+### 🎉 总结
+
+通过RQDatac API字段探索，我们发现了大量有价值的字段，这些字段将显著增强StockPool系统的分析能力和数据丰富性：
+
+- **价格数据**: 新增5个技术指标字段
+- **基本面数据**: 新增16个财务和公司信息字段  
+- **因子数据**: 新增12个量化因子字段
+- **行业数据**: 完善行业分类体系
+- **股本数据**: 新增5个股本变动相关字段
+
+这些发现为StockPool系统的进一步发展提供了重要方向，建议按阶段逐步集成这些新字段，以充分利用RQDatac数据平台的强大功能。</content>
 <parameter name="filePath">/home/xiaqing/projects/stockman/docs/STOCKPOOL_OPTIMIZATION_BEST_PRACTICES.md

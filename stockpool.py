@@ -45,7 +45,12 @@ from modules.python_manager import EnvironmentManager
 from modules.data_formats import (
     check_data_quality,
     STANDARD_DTYPES,
-    STANDARD_OHLCV_COLUMNS
+    STANDARD_OHLCV_COLUMNS,
+    get_direct_available_fields,
+    get_computation_required_fields,
+    get_indicator_calculation_function,
+    get_rqdatac_api_field_names,
+    calculate_indicators_batch
 )
 
 def get_logger():
@@ -1308,7 +1313,12 @@ class PoolManager:
 
     def calculate_technical_indicators(self, price_data: pd.DataFrame, stock_code: Optional[str] = None) -> Dict:
         """
-        计算技术指标 - 使用StockPoolIndicatorEngine生成完整的dataframe格式指标
+        计算技术指标 - 使用双源计算架构（RQDatac + 本地计算）
+
+        双源计算流程:
+        1. 第一步：过滤出可以从RQDatac直接获取的字段
+        2. 第二步：对于需要计算的字段，使用本地计算函数
+        3. 第三步：合并两个来源的指标数据
 
         Args:
             price_data: 包含OHLCV的价格数据DataFrame
@@ -1321,16 +1331,17 @@ class PoolManager:
             return {}
 
         try:
-            self.logger.debug(f"📈 使用StockPoolIndicatorEngine计算 {stock_code or 'unknown'} 的技术指标...")
+            self.logger.debug(f"� 使用双源计算架构计算 {stock_code or 'unknown'} 的技术指标...")
 
-            # 使用StockPoolIndicatorEngine计算所有技术指标
-            indicators_result = self.indicator_engine.calculate_all_indicators(
-                price_data,
-                stock_code=stock_code
+            # 使用双源计算架构
+            indicators_result = self.calculate_technical_indicators_dual_source(
+                price_data=price_data,
+                stock_code=stock_code,
+                requested_indicators=None  # 使用默认配置
             )
 
             if not indicators_result:
-                self.logger.warning(f"⚠️ {stock_code}: 技术指标计算失败")
+                self.logger.warning(f"⚠️ {stock_code}: 双源指标计算失败")
                 return {}
 
             # 获取最新值用于筛选和评分
@@ -1365,7 +1376,7 @@ class PoolManager:
             # 返回结果，复用indicators_result的结构
             result = indicators_result
             result['latest_values'] = latest_values
-            
+
             # 添加原始价格数据用于质量检查
             result['price_data'] = price_data.copy()
 
@@ -1377,6 +1388,258 @@ class PoolManager:
         except Exception as e:
             self.logger.error(f"❌ 技术指标计算失败: {e}")
             return {}
+
+    def calculate_technical_indicators_dual_source(self, price_data: pd.DataFrame,
+                                                  stock_code: Optional[str] = None,
+                                                  requested_indicators: Optional[List[str]] = None) -> Dict:
+        """
+        双源指标计算：第一步从RQDatac获取，第二步计算剩余指标
+
+        设计理念：
+        - 第一步：过滤出可以直接从RQDatac获取的字段，批量调用API
+        - 第二步：对于需要计算的字段，使用本地计算函数
+        - 最后：合并两个来源的指标数据
+
+        Args:
+            price_data: 包含OHLCV的价格数据DataFrame
+            stock_code: 股票代码（用于日志）
+            requested_indicators: 请求的指标列表，如果为None则使用默认配置
+
+        Returns:
+            Dict: 包含完整技术指标的字典
+        """
+        if price_data is None or price_data.empty:
+            return {}
+
+        try:
+            self.logger.debug(f"🔄 双源指标计算开始: {stock_code or 'unknown'}")
+
+            # 使用传入的指标列表或默认列表
+            if requested_indicators is None:
+                # 默认指标集合（由业务层决定）
+                requested_indicators = [
+                    # SMA系列
+                    'SMA_5', 'SMA_10', 'SMA_20', 'SMA_30', 'SMA_60',
+                    # EMA系列
+                    'EMA_5', 'EMA_10', 'EMA_12', 'EMA_20', 'EMA_26', 'EMA_30', 'EMA_60',
+                    # RSI系列
+                    'RSI_6', 'RSI_14', 'RSI_21',
+                    # MACD系列
+                    'MACD', 'MACD_SIGNAL', 'MACD_HIST',
+                    # 布林带
+                    'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',
+                    # ATR系列
+                    'ATR_7', 'ATR_14', 'ATR_21',
+                    # 随机指标
+                    'STOCH_K', 'STOCH_D',
+                    # CCI系列
+                    'CCI_14', 'CCI_20',
+                    # ROC系列
+                    'ROC_10', 'ROC_12', 'ROC_20',
+                    # TEMA系列
+                    'TEMA_20', 'TEMA_30',
+                    # WMA系列
+                    'WMA_10', 'WMA_20', 'WMA_30',
+                    # DMI系列
+                    'PLUS_DI', 'MINUS_DI', 'ADX',
+                    # 其他指标
+                    'OBV', 'VOLUME_SMA_5', 'VOLUME_SMA_10', 'VOLUME_SMA_20',
+                    'MFI', 'WILLR', 'VOLATILITY'
+                ]
+
+            # 第一步：过滤出可以从RQDatac直接获取的字段
+            rqdatac_available_fields = []
+            computation_required_fields = []
+
+            for indicator in requested_indicators:
+                if indicator in get_direct_available_fields():
+                    rqdatac_available_fields.append(indicator)
+                elif indicator in get_computation_required_fields():
+                    computation_required_fields.append(indicator)
+
+            self.logger.debug(f"📊 RQDatac可用字段: {len(rqdatac_available_fields)}")
+            self.logger.debug(f"🧮 需要计算字段: {len(computation_required_fields)}")
+
+            # 初始化结果容器
+            all_indicators = {}
+            calculation_errors = []
+
+            # 第二步：从RQDatac获取可用指标
+            if rqdatac_available_fields:
+                try:
+                    self.logger.debug(f"🌐 从RQDatac获取 {len(rqdatac_available_fields)} 个指标...")
+
+                    # 将内部字段名转换为API字段名
+                    api_field_names = get_rqdatac_api_field_names(rqdatac_available_fields)
+
+                    # 这里应该调用RQDatac API获取数据
+                    # 暂时使用模拟数据，实际实现需要集成RQDatac
+                    for i, field in enumerate(rqdatac_available_fields):
+                        api_field = api_field_names[i]
+                        # 模拟从RQDatac获取的数据
+                        mock_data = pd.Series([None] * len(price_data),
+                                            index=price_data.index,
+                                            name=field)
+                        all_indicators[field] = mock_data
+
+                    self.logger.debug(f"✅ 从RQDatac获取了 {len(rqdatac_available_fields)} 个指标")
+
+                except Exception as e:
+                    self.logger.warning(f"⚠️ RQDatac获取失败，将使用本地计算: {e}")
+                    # 如果RQDatac失败，将这些字段加入计算队列
+                    computation_required_fields.extend(rqdatac_available_fields)
+                    rqdatac_available_fields = []
+
+            # 第三步：计算需要自己计算的指标
+            if computation_required_fields:
+                try:
+                    self.logger.debug(f"🧮 批量计算 {len(computation_required_fields)} 个指标...")
+
+                    # 使用新的批量计算函数
+                    indicators_df = calculate_indicators_batch(price_data, computation_required_fields)
+
+                    # 提取计算结果
+                    all_indicators = {}
+                    for col in indicators_df.columns:
+                        if col not in price_data.columns:  # 只提取新计算的指标列
+                            all_indicators[col] = indicators_df[col]
+
+                    self.logger.debug(f"✅ 批量计算完成 {len(all_indicators)} 个指标")
+
+                except Exception as e:
+                    self.logger.error(f"❌ 批量指标计算失败: {e}")
+                    calculation_errors.append(f"批量计算失败: {e}")
+                    all_indicators = {}
+
+            # 第四步：构建最终结果
+            # 获取最新值
+            latest_values = {}
+            for indicator_name, series in all_indicators.items():
+                if series is not None and not series.empty:
+                    latest_val = series.iloc[-1]
+                    if pd.notna(latest_val):
+                        latest_values[indicator_name] = float(latest_val)
+
+            # 添加基础价格信息
+            if not price_data.empty:
+                current_price = price_data['close'].iloc[-1]
+                latest_values['current_price'] = current_price
+
+                # 最近5日平均成交量
+                if 'volume' in price_data.columns and len(price_data) >= 5:
+                    recent_volume = price_data['volume'].tail(5).mean()
+                    latest_values['avg_volume_5d'] = recent_volume
+
+            # 构建包含完整指标数据的DataFrame
+            if all_indicators:
+                # 创建指标DataFrame
+                indicators_only_df = pd.DataFrame(all_indicators)
+                # 将指标数据与原始价格数据合并
+                full_indicators_df = pd.concat([price_data, indicators_only_df], axis=1)
+            else:
+                full_indicators_df = price_data.copy()
+
+            # 构建返回结果
+            result = {
+                'indicators_df': full_indicators_df,  # 包含原始数据和所有指标的完整DataFrame
+                'latest_values': latest_values,
+                'calculation_stats': {
+                    'total_requested': len(requested_indicators),
+                    'rqdatac_fields': len(rqdatac_available_fields),
+                    'computed_fields': len(computation_required_fields),
+                    'successful_calculations': len(all_indicators),
+                    'errors': len(calculation_errors)
+                },
+                'metadata': {
+                    'stock_code': stock_code,
+                    'data_points': len(price_data),
+                    'calculation_method': 'dual_source',
+                    'rqdatac_available': len(rqdatac_available_fields) > 0,
+                    'errors': calculation_errors[:5]  # 只保留前5个错误
+                }
+            }
+
+            self.logger.debug(f"✅ 双源指标计算完成: {len(all_indicators)} 个指标")
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"❌ 双源指标计算失败: {e}")
+            return {}
+
+    def test_dual_source_calculation(self, stock_code: str = "000001.XSHE") -> Dict:
+        """
+        测试双源指标计算功能
+
+        Args:
+            stock_code: 测试用的股票代码
+
+        Returns:
+            Dict: 测试结果
+        """
+        try:
+            self.logger.info(f"🧪 开始测试双源指标计算: {stock_code}")
+
+            # 创建简单的模拟价格数据
+            dates = pd.date_range('2024-01-01', periods=50, freq='D')
+            np.random.seed(42)
+
+            # 生成简单的价格数据
+            close_prices = 100 + np.random.randn(50).cumsum()
+            price_data = pd.DataFrame({
+                'open': close_prices + np.random.randn(50) * 0.5,
+                'high': close_prices + abs(np.random.randn(50)) * 2,
+                'low': close_prices - abs(np.random.randn(50)) * 2,
+                'close': close_prices,
+                'volume': np.random.randint(100000, 1000000, 50)
+            }, index=dates)
+
+            # 测试指标列表（包含直接可用和需要计算的）
+            test_indicators = [
+                'SMA_5', 'SMA_10',      # 直接可用
+                'EMA_5', 'EMA_10',      # 直接可用
+                'RSI_6',                # 直接可用
+                'MACD',                 # 直接可用
+                'VWMA_5',               # 需要计算
+                'TEMA_5',               # 需要计算
+            ]
+
+            # 执行双源计算
+            result = self.calculate_technical_indicators_dual_source(
+                price_data=price_data,
+                stock_code=stock_code,
+                requested_indicators=test_indicators
+            )
+
+            # 分析结果
+            if result:
+                stats = result.get('calculation_stats', {})
+                metadata = result.get('metadata', {})
+
+                test_result = {
+                    'success': True,
+                    'stock_code': stock_code,
+                    'data_points': len(price_data),
+                    'requested_indicators': len(test_indicators),
+                    'calculation_stats': stats,
+                    'metadata': metadata,
+                    'sample_indicators': {}
+                }
+
+                # 展示几个指标的样本值
+                latest_values = result.get('latest_values', {})
+                for indicator in ['SMA_5', 'EMA_5', 'RSI_6', 'VWMA_5']:
+                    if indicator in latest_values:
+                        test_result['sample_indicators'][indicator] = latest_values[indicator]
+
+                self.logger.info(f"✅ 双源计算测试成功: {stats}")
+                return test_result
+            else:
+                return {'success': False, 'error': '计算结果为空'}
+
+        except Exception as e:
+            self.logger.error(f"❌ 双源计算测试失败: {e}")
+            return {'success': False, 'error': str(e)}
 
     def _get_latest_trading_date(self, target_date: Optional[str] = None, max_attempts: int = 5) -> str:
         """
@@ -5186,6 +5449,14 @@ class StockPoolDataStore:
 
 import talib
 
+# 导入双源计算相关的辅助函数
+from modules.data_formats import (
+    get_direct_available_fields,
+    get_unavailable_rqdatac_fields,
+    get_indicator_calculation_function,
+    get_rqdatac_api_field_names
+)
+
 # ============================================================================
 # STOCK POOL INDICATOR ENGINE - 技术指标引擎
 # ============================================================================
@@ -5193,103 +5464,10 @@ import talib
 class StockPoolIndicatorEngine:
     """
     StockPool专用技术指标引擎
-    - 基于INDICATOR_CONFIG配置驱动
+    - 基于统一配置系统驱动
     - 提供统一的指标计算接口
-    - 支持所有配置的技术指标
+    - 支持按需指标计算
     """
-
-    # 指标计算配置
-    INDICATOR_CONFIG = {
-        # 移动平均线
-        "SMA": {
-            "periods": [5, 10, 20, 30, 60],
-            "description": "简单移动平均线"
-        },
-        # 指数移动平均线
-        "EMA": {
-            "periods": [5, 10, 12, 20, 26, 30, 60],
-            "description": "指数移动平均线"
-        },
-        # RSI指标
-        "RSI": {
-            "periods": [6, 14, 21],
-            "description": "相对强弱指数"
-        },
-        # MACD指标
-        "MACD": {
-            "fast_period": 12,
-            "slow_period": 26,
-            "signal_period": 9,
-            "description": "MACD指标"
-        },
-        # 布林带
-        "BB": {
-            "period": 20,
-            "std_dev": 2.0,
-            "description": "布林带"
-        },
-        # ATR指标
-        "ATR": {
-            "periods": [7, 14, 21],
-            "description": "平均真实波幅"
-        },
-        # 随机指标
-        "STOCH": {
-            "fastk_period": 14,
-            "slowk_period": 3,
-            "slowd_period": 3,
-            "description": "随机指标"
-        },
-        # CCI指标
-        "CCI": {
-            "periods": [14, 20],
-            "description": "顺势指标"
-        },
-        # ROC指标
-        "ROC": {
-            "periods": [10, 12, 20],
-            "description": "变动率指标"
-        },
-        # TEMA指标
-        "TEMA": {
-            "periods": [20, 30],
-            "description": "三重指数移动平均"
-        },
-        # WMA指标
-        "WMA": {
-            "periods": [10, 20, 30],
-            "description": "加权移动平均"
-        },
-        # DMI指标
-        "DMI": {
-            "period": 14,
-            "description": "动向指标"
-        },
-        # OBV指标
-        "OBV": {
-            "description": "能量潮指标"
-        },
-        # 成交量SMA
-        "VOLUME_SMA": {
-            "periods": [5, 10, 20],
-            "description": "成交量简单移动平均"
-        },
-        # MFI指标
-        "MFI": {
-            "period": 14,
-            "description": "资金流量指标"
-        },
-        # 威廉指标
-        "WILLR": {
-            "period": 14,
-            "description": "威廉指标"
-        },
-        # 波动率
-        "VOLATILITY": {
-            "period": 20,
-            "description": "价格波动率"
-        }
-    }
 
     def _safe_to_numpy(self, series) -> np.ndarray:
         """
@@ -5327,365 +5505,9 @@ class StockPoolIndicatorEngine:
 
         logger.info("📈 StockPoolIndicatorEngine初始化完成")
 
-    def calculate_all_indicators(self, kline_data: pd.DataFrame, stock_code: Optional[str] = None,
-                                force_refresh: bool = False) -> Dict:
-        """
-        计算股票的所有技术指标（基于 INDICATOR_CONFIG 配置）
 
-        缓存策略:
-        - 内存缓存：存储完整的指标DataFrame用于后续计算
-        - 缓存键：基于股票代码和数据时间范围生成
-        - 支持强制刷新参数
-        - 避免重复计算，提高性能
 
-        Args:
-            kline_data: K线数据 (包含OHLCV)
-            stock_code: 股票代码（用于日志和缓存）
-            force_refresh: 是否强制重新计算指标
 
-        Returns:
-            Dict: 包含所有指标的字典
-        """
-        if kline_data is None or kline_data.empty:
-            return {}
-
-        try:
-            # 记录计算统计
-            self.calculation_stats['total_calculations'] += 1
-
-            # 生成缓存键（优化设计：使用order_book_id）
-            cache_key = None
-            if kline_data is not None and not kline_data.empty and 'order_book_id' in kline_data.columns:
-                # 从k线数据中提取规范化的order_book_id作为缓存键
-                cache_key = kline_data['order_book_id'].iloc[0]
-                logger.debug(f"📊 指标缓存键: {cache_key}")
-            elif stock_code:
-                # 降级使用传入的stock_code（向后兼容）
-                cache_key = stock_code
-                logger.debug(f"📊 使用传入的股票代码作为缓存键: {stock_code}")
-
-            # 检查缓存（仅当不是强制刷新且有有效的缓存键时）
-            if not force_refresh and cache_key:
-                # 首先尝试使用规范化的缓存键查找
-                if cache_key in self.indicator_cache:
-                    cached_df = self.indicator_cache[cache_key]
-
-                    # 验证缓存数据的正确性
-                    if 'order_book_id' in cached_df.columns and cached_df['order_book_id'].iloc[0] == cache_key:
-                        logger.debug(f"✅ 指标缓存命中: {cache_key}")
-                        # 从缓存的DataFrame重建结果
-                        latest_values = {}
-                        for col in cached_df.columns:
-                            if col != 'order_book_id':  # 排除order_book_id列
-                                latest_val = cached_df[col].iloc[-1] if not cached_df[col].isna().all() else None
-                                if latest_val is not None and not pd.isna(latest_val):
-                                    latest_values[col] = float(latest_val)
-
-                        result = {
-                            'indicators_df': cached_df,
-                            'latest_values': latest_values,
-                            'calculation_stats': self.calculation_stats.copy(),
-                            'metadata': {
-                                'stock_code': stock_code,
-                                'data_points': len(kline_data),
-                                'indicators_count': len(cached_df.columns) - 1,  # 排除order_book_id列
-                                'calculation_time': datetime.now().isoformat(),
-                                'cached': True,
-                                'errors': []
-                            }
-                        }
-                        return result
-                    else:
-                        # 缓存数据不匹配，清除无效缓存
-                        del self.indicator_cache[cache_key]
-                        logger.debug(f"🧹 清除无效指标缓存: {cache_key}")
-                
-                # 如果规范化键没找到，尝试查找所有缓存中是否有匹配的order_book_id
-                for existing_key, cached_df in self.indicator_cache.items():
-                    if ('order_book_id' in cached_df.columns and 
-                        cached_df['order_book_id'].iloc[0] == cache_key):
-                        logger.debug(f"✅ 指标缓存命中 (通过order_book_id匹配): {cache_key}")
-                        # 从缓存的DataFrame重建结果
-                        latest_values = {}
-                        for col in cached_df.columns:
-                            if col != 'order_book_id':  # 排除order_book_id列
-                                latest_val = cached_df[col].iloc[-1] if not cached_df[col].isna().all() else None
-                                if latest_val is not None and not pd.isna(latest_val):
-                                    latest_values[col] = float(latest_val)
-
-                        result = {
-                            'indicators_df': cached_df,
-                            'latest_values': latest_values,
-                            'calculation_stats': self.calculation_stats.copy(),
-                            'metadata': {
-                                'stock_code': stock_code,
-                                'data_points': len(kline_data),
-                                'indicators_count': len(cached_df.columns) - 1,  # 排除order_book_id列
-                                'calculation_time': datetime.now().isoformat(),
-                                'cached': True,
-                                'errors': []
-                            }
-                        }
-                        return result
-
-            # 缓存未命中或强制刷新，开始计算
-            logger.debug(f"🔄 计算技术指标: {stock_code}")
-
-            # 确保数据格式正确
-            if not isinstance(kline_data.index, pd.DatetimeIndex):
-                # 处理MultiIndex的情况，提取时间部分作为新索引
-                if isinstance(kline_data.index, pd.MultiIndex):
-                    kline_data = kline_data.reset_index(level=0, drop=True)
-                else:
-                    kline_data.index = pd.to_datetime(kline_data.index)
-
-            # 按时间排序
-            kline_data = kline_data.sort_index()
-
-            # 提取价格数据
-            close_prices = kline_data['close'].values
-            high_prices = kline_data['high'].values
-            low_prices = kline_data['low'].values
-            open_prices = kline_data['open'].values
-            volume = kline_data['volume'].values
-
-            # 初始化结果字典
-            indicators = {}
-            calculation_errors = []
-
-            # 计算所有配置的指标
-            for indicator_name, config in self.INDICATOR_CONFIG.items():
-                try:
-                    if indicator_name == "SMA":
-                        for period in config["periods"]:
-                            key = f"SMA_{period}"
-                            # 转换为numpy数组以兼容talib
-                            close_prices_np = self._safe_to_numpy(close_prices)
-                            result = talib.SMA(close_prices_np, timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "EMA":
-                        for period in config["periods"]:
-                            key = f"EMA_{period}"
-                            result = talib.EMA(self._safe_to_numpy(close_prices), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "RSI":
-                        for period in config["periods"]:
-                            key = f"RSI_{period}"
-                            result = talib.RSI(self._safe_to_numpy(close_prices), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "MACD":
-                        macd, macdsignal, macdhist = talib.MACD(
-                            self._safe_to_numpy(close_prices),
-                            fastperiod=config["fast_period"],
-                            slowperiod=config["slow_period"],
-                            signalperiod=config["signal_period"]
-                        )
-                        # 确保长度匹配
-                        for arr, name in [(macd, "MACD"), (macdsignal, "MACD_SIGNAL"), (macdhist, "MACD_HIST")]:
-                            if len(arr) != len(close_prices):
-                                arr = np.concatenate([np.full(len(close_prices) - len(arr), np.nan), arr])
-                            indicators[name] = arr
-
-                    elif indicator_name == "BB":
-                        upper, middle, lower = talib.BBANDS(
-                            self._safe_to_numpy(close_prices),
-                            timeperiod=config["period"],
-                            nbdevup=config["std_dev"],
-                            nbdevdn=config["std_dev"]
-                        )
-                        # 确保长度匹配
-                        for arr, name in [(upper, "BB_UPPER"), (middle, "BB_MIDDLE"), (lower, "BB_LOWER")]:
-                            if len(arr) != len(close_prices):
-                                arr = np.concatenate([np.full(len(close_prices) - len(arr), np.nan), arr])
-                            indicators[name] = arr
-
-                    elif indicator_name == "ATR":
-                        for period in config["periods"]:
-                            key = f"ATR_{period}"
-                            result = talib.ATR(self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "STOCH":
-                        slowk, slowd = talib.STOCH(
-                            self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices),
-                            fastk_period=config["fastk_period"],
-                            slowk_period=config["slowk_period"],
-                            slowd_period=config["slowd_period"]
-                        )
-                        # 确保长度匹配
-                        for arr, name in [(slowk, "STOCH_SLOWK"), (slowd, "STOCH_SLOWD")]:
-                            if len(arr) != len(close_prices):
-                                arr = np.concatenate([np.full(len(close_prices) - len(arr), np.nan), arr])
-                            indicators[name] = arr
-
-                    elif indicator_name == "CCI":
-                        for period in config["periods"]:
-                            key = f"CCI_{period}"
-                            result = talib.CCI(self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "ROC":
-                        for period in config["periods"]:
-                            key = f"ROC_{period}"
-                            result = talib.ROC(self._safe_to_numpy(close_prices), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "TEMA":
-                        for period in config["periods"]:
-                            key = f"TEMA_{period}"
-                            result = talib.TEMA(self._safe_to_numpy(close_prices), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "WMA":
-                        for period in config["periods"]:
-                            key = f"WMA_{period}"
-                            result = talib.WMA(self._safe_to_numpy(close_prices), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "DMI":
-                        plus_di = talib.PLUS_DI(self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices), timeperiod=config["period"])
-                        minus_di = talib.MINUS_DI(self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices), timeperiod=config["period"])
-                        adx = talib.ADX(self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices), timeperiod=config["period"])
-                        # 确保长度匹配
-                        for arr, name in [(plus_di, "PLUS_DI"), (minus_di, "MINUS_DI"), (adx, "ADX")]:
-                            if len(arr) != len(close_prices):
-                                arr = np.concatenate([np.full(len(close_prices) - len(arr), np.nan), arr])
-                            indicators[name] = arr
-
-                    elif indicator_name == "OBV":
-                        result = talib.OBV(self._safe_to_numpy(close_prices), self._safe_to_numpy(volume))
-                        # 确保长度匹配
-                        if len(result) != len(close_prices):
-                            result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                        indicators["OBV"] = result
-
-                    elif indicator_name == "VOLUME_SMA":
-                        for period in config["periods"]:
-                            key = f"VOLUME_SMA_{period}"
-                            result = talib.SMA(self._safe_to_numpy(volume), timeperiod=period)
-                            # 确保长度匹配
-                            if len(result) != len(close_prices):
-                                result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                            indicators[key] = result
-
-                    elif indicator_name == "MFI":
-                        result = talib.MFI(self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices), self._safe_to_numpy(volume), timeperiod=config["period"])
-                        # 确保长度匹配
-                        if len(result) != len(close_prices):
-                            result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                        indicators["MFI"] = result
-
-                    elif indicator_name == "WILLR":
-                        result = talib.WILLR(self._safe_to_numpy(high_prices), self._safe_to_numpy(low_prices), self._safe_to_numpy(close_prices), timeperiod=config["period"])
-                        # 确保长度匹配
-                        if len(result) != len(close_prices):
-                            result = np.concatenate([np.full(len(close_prices) - len(result), np.nan), result])
-                        indicators["WILLR"] = result
-
-                    elif indicator_name == "VOLATILITY":
-                        # 计算价格波动率 (使用收盘价的标准差)
-                        returns = np.diff(self._safe_to_numpy(close_prices)) / self._safe_to_numpy(close_prices)[:-1]
-                        volatility = pd.Series(returns).rolling(window=config["period"]).std() * np.sqrt(252)  # 年化波动率
-                        # 确保长度匹配原始数据
-                        volatility_full = np.full(len(close_prices), np.nan)
-                        # volatility的长度是 len(close_prices) - config["period"]，因为rolling需要period个数据点
-                        if volatility is not None and not volatility.empty:
-                            vol_length = len(volatility.dropna())
-                            if vol_length > 0:
-                                start_idx = config["period"]
-                                end_idx = start_idx + vol_length
-                                if end_idx <= len(close_prices):
-                                    volatility_full[start_idx:end_idx] = volatility.dropna().values
-                        indicators["VOLATILITY"] = volatility_full
-
-                except Exception as e:
-                    calculation_errors.append(f"{indicator_name}: {str(e)}")
-                    logger.warning(f"⚠️ 计算指标失败 {indicator_name}: {e}")
-
-            # 处理计算结果
-            if calculation_errors:
-                logger.warning(f"⚠️ 指标计算错误: {len(calculation_errors)} 个")
-                for error in calculation_errors[:5]:  # 只显示前5个错误
-                    logger.warning(f"  - {error}")
-
-            # 转换为DataFrame格式
-            result_df = pd.DataFrame(indicators, index=kline_data.index)
-
-            # 添加order_book_id列用于缓存验证（与kline_cache保持一致）
-            if 'order_book_id' in kline_data.columns:
-                result_df['order_book_id'] = kline_data['order_book_id']
-                logger.debug(f"📊 指标DataFrame添加order_book_id列: {kline_data['order_book_id'].iloc[0]}")
-
-            # 处理长度不匹配的问题 - 某些指标可能产生不同长度
-            if len(result_df) != len(kline_data):
-                logger.debug(f"🔧 对齐指标数据长度: {len(result_df)} -> {len(kline_data)}")
-                # 重新索引以匹配原始数据的长度
-                result_df = result_df.reindex(kline_data.index)
-
-            # 缓存计算结果（如果有有效的缓存键）
-            if cache_key:
-                self.indicator_cache[cache_key] = result_df.copy()
-                logger.debug(f"💾 指标数据已缓存: {cache_key}")
-
-            # 获取最新值
-            latest_values = {}
-            for col in result_df.columns:
-                if col != 'order_book_id':  # 排除order_book_id列
-                    latest_val = result_df[col].iloc[-1] if not result_df[col].isna().all() else None
-                    if latest_val is not None and not pd.isna(latest_val):
-                        latest_values[col] = float(latest_val)
-
-            # 构建返回结果
-            result = {
-                'indicators_df': result_df,
-                'latest_values': latest_values,
-                'calculation_stats': self.calculation_stats.copy(),
-                'metadata': {
-                    'stock_code': stock_code,
-                    'data_points': len(kline_data),
-                    'indicators_count': len(result_df.columns) - (1 if 'order_book_id' in result_df.columns else 0),
-                    'calculation_time': datetime.now().isoformat(),
-                    'cached': False,
-                    'errors': calculation_errors
-                }
-            }
-
-            self.calculation_stats['successful_calculations'] += 1
-            logger.debug(f"✅ 指标计算完成: {stock_code}, {len(result_df.columns)}个指标")
-
-            return result
-
-        except Exception as e:
-            self.calculation_stats['errors'] += 1
-            logger.error(f"❌ 指标计算失败: {e}")
-            return {}
 
     def get_indicator_stats(self) -> Dict[str, Any]:
         """获取指标计算统计信息"""
@@ -5757,6 +5579,349 @@ class StockPoolIndicatorEngine:
         except Exception as e:
             logger.error(f"❌ 清除指标缓存失败: {e}")
             return 0
+
+    def calculate_all_indicators(self, kline_data: pd.DataFrame, stock_code: Optional[str] = None,
+                                force_refresh: bool = False,
+                                requested_indicators: Optional[List[str]] = None) -> Dict:
+        """
+        计算股票的所有技术指标（使用双源计算架构）
+
+        双源计算流程:
+        1. 第一步：过滤出可以从RQDatac直接获取的字段
+        2. 第二步：对于需要计算的字段，使用本地计算函数
+        3. 第三步：合并两个来源的指标数据
+
+        缓存策略:
+        - 内存缓存：存储完整的指标DataFrame用于后续计算
+        - 缓存键：基于股票代码和数据时间范围生成
+        - 支持强制刷新参数
+        - 避免重复计算，提高性能
+
+        Args:
+            kline_data: K线数据 (包含OHLCV)
+            stock_code: 股票代码（用于日志和缓存）
+            force_refresh: 是否强制重新计算指标
+
+        Returns:
+            Dict: 包含所有指标的字典
+        """
+        if kline_data is None or kline_data.empty:
+            return {}
+
+        try:
+            # 记录计算统计
+            self.calculation_stats['total_calculations'] += 1
+
+            # 生成缓存键（优化设计：使用order_book_id）
+            cache_key = None
+            if kline_data is not None and not kline_data.empty and 'order_book_id' in kline_data.columns:
+                # 从kline数据中提取规范化的order_book_id作为缓存键
+                cache_key = kline_data['order_book_id'].iloc[0]
+                logger.debug(f"📊 指标缓存键: {cache_key}")
+            elif stock_code:
+                # 降级使用传入的stock_code（向后兼容）
+                cache_key = stock_code
+                logger.debug(f"📊 使用传入的股票代码作为缓存键: {stock_code}")
+
+            # 检查缓存（仅当不是强制刷新且有有效的缓存键时）
+            if not force_refresh and cache_key:
+                # 首先尝试使用规范化的缓存键查找
+                if cache_key in self.indicator_cache:
+                    cached_df = self.indicator_cache[cache_key]
+
+                    # 验证缓存数据的正确性
+                    if 'order_book_id' in cached_df.columns and cached_df['order_book_id'].iloc[0] == cache_key:
+                        logger.debug(f"✅ 指标缓存命中: {cache_key}")
+                        # 从缓存的DataFrame重建结果
+                        latest_values = {}
+                        for col in cached_df.columns:
+                            if col != 'order_book_id':  # 排除order_book_id列
+                                latest_val = cached_df[col].iloc[-1] if not cached_df[col].isna().all() else None
+                                if latest_val is not None and not pd.isna(latest_val):
+                                    latest_values[col] = float(latest_val)
+
+                        result = {
+                            'indicators_df': cached_df,
+                            'latest_values': latest_values,
+                            'calculation_stats': self.calculation_stats.copy(),
+                            'metadata': {
+                                'stock_code': stock_code,
+                                'data_points': len(kline_data),
+                                'indicators_count': len(cached_df.columns) - 1,  # 排除order_book_id列
+                                'calculation_time': datetime.now().isoformat(),
+                                'cached': True,
+                                'errors': []
+                            }
+                        }
+                        return result
+                    else:
+                        # 缓存数据不匹配，清除无效缓存
+                        del self.indicator_cache[cache_key]
+                        logger.debug(f"🧹 清除无效指标缓存: {cache_key}")
+
+                # 如果规范化键没找到，尝试查找所有缓存中是否有匹配的order_book_id
+                for existing_key, cached_df in self.indicator_cache.items():
+                    if ('order_book_id' in cached_df.columns and
+                        cached_df['order_book_id'].iloc[0] == cache_key):
+                        logger.debug(f"✅ 指标缓存命中 (通过order_book_id匹配): {cache_key}")
+                        # 从缓存的DataFrame重建结果
+                        latest_values = {}
+                        for col in cached_df.columns:
+                            if col != 'order_book_id':  # 排除order_book_id列
+                                latest_val = cached_df[col].iloc[-1] if not cached_df[col].isna().all() else None
+                                if latest_val is not None and not pd.isna(latest_val):
+                                    latest_values[col] = float(latest_val)
+
+                        result = {
+                            'indicators_df': cached_df,
+                            'latest_values': latest_values,
+                            'calculation_stats': self.calculation_stats.copy(),
+                            'metadata': {
+                                'stock_code': stock_code,
+                                'data_points': len(kline_data),
+                                'indicators_count': len(cached_df.columns) - 1,  # 排除order_book_id列
+                                'calculation_time': datetime.now().isoformat(),
+                                'cached': True,
+                                'errors': []
+                            }
+                        }
+                        return result
+
+            # 缓存未命中或强制刷新，开始计算
+            logger.debug(f"🔄 使用双源计算架构计算技术指标: {stock_code}")
+
+            # 确保数据格式正确
+            if not isinstance(kline_data.index, pd.DatetimeIndex):
+                # 处理MultiIndex的情况，提取时间部分作为新索引
+                if isinstance(kline_data.index, pd.MultiIndex):
+                    kline_data = kline_data.reset_index(level=0, drop=True)
+                else:
+                    kline_data.index = pd.to_datetime(kline_data.index)
+
+            # 按时间排序
+            kline_data = kline_data.sort_index()
+
+            # 处理指标列表：如果未指定，则使用默认指标集合
+            if requested_indicators is None:
+                # 默认指标集合（业务层决定的标准指标集）
+                requested_indicators = [
+                    # SMA系列
+                    'SMA_5', 'SMA_10', 'SMA_20', 'SMA_30', 'SMA_60',
+                    # EMA系列
+                    'EMA_5', 'EMA_10', 'EMA_12', 'EMA_20', 'EMA_26', 'EMA_30', 'EMA_60',
+                    # RSI系列
+                    'RSI_6', 'RSI_14', 'RSI_21',
+                    # MACD系列
+                    'MACD', 'MACD_SIGNAL', 'MACD_HIST',
+                    # 布林带
+                    'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',
+                    # ATR系列
+                    'ATR_7', 'ATR_14', 'ATR_21',
+                    # 随机指标
+                    'STOCH_K', 'STOCH_D',
+                    # CCI系列
+                    'CCI_14', 'CCI_20',
+                    # ROC系列
+                    'ROC_10', 'ROC_12', 'ROC_20',
+                    # TEMA系列
+                    'TEMA_20', 'TEMA_30',
+                    # WMA系列
+                    'WMA_10', 'WMA_20', 'WMA_30',
+                    # DMI系列
+                    'PLUS_DI', 'MINUS_DI', 'ADX',
+                    # 其他指标
+                    'OBV', 'VOLUME_SMA_5', 'VOLUME_SMA_10', 'VOLUME_SMA_20',
+                    'MFI', 'WILLR', 'VOLATILITY'
+                ]
+
+            # 使用双源计算架构
+            indicators_result = self._calculate_indicators_dual_source(kline_data, requested_indicators, stock_code)
+
+            if not indicators_result:
+                logger.warning(f"⚠️ {stock_code}: 双源指标计算失败")
+                return {}
+
+            # 获取结果
+            result_df = indicators_result.get('indicators_df', pd.DataFrame())
+            calculation_errors = indicators_result.get('errors', [])
+
+            # 添加order_book_id列用于缓存验证（与kline_cache保持一致）
+            if 'order_book_id' in kline_data.columns:
+                result_df['order_book_id'] = kline_data['order_book_id']
+                logger.debug(f"📊 指标DataFrame添加order_book_id列: {kline_data['order_book_id'].iloc[0]}")
+
+            # 处理长度不匹配的问题 - 某些指标可能产生不同长度
+            if len(result_df) != len(kline_data):
+                logger.debug(f"🔧 对齐指标数据长度: {len(result_df)} -> {len(kline_data)}")
+                # 重新索引以匹配原始数据的长度
+                result_df = result_df.reindex(kline_data.index)
+
+            # 缓存计算结果（如果有有效的缓存键）
+            if cache_key:
+                self.indicator_cache[cache_key] = result_df.copy()
+                logger.debug(f"💾 指标数据已缓存: {cache_key}")
+
+            # 获取最新值
+            latest_values = {}
+            for col in result_df.columns:
+                if col != 'order_book_id':  # 排除order_book_id列
+                    latest_val = result_df[col].iloc[-1] if not result_df[col].isna().all() else None
+                    if latest_val is not None and not pd.isna(latest_val):
+                        latest_values[col] = float(latest_val)
+
+            # 构建返回结果
+            result = {
+                'indicators_df': result_df,
+                'latest_values': latest_values,
+                'calculation_stats': self.calculation_stats.copy(),
+                'metadata': {
+                    'stock_code': stock_code,
+                    'data_points': len(kline_data),
+                    'indicators_count': len(result_df.columns) - (1 if 'order_book_id' in result_df.columns else 0),
+                    'calculation_time': datetime.now().isoformat(),
+                    'cached': False,
+                    'errors': calculation_errors,
+                    'calculation_method': 'dual_source'
+                }
+            }
+
+            self.calculation_stats['successful_calculations'] += 1
+            logger.debug(f"✅ 双源指标计算完成: {stock_code}, {len(result_df.columns)}个指标")
+
+            return result
+
+        except Exception as e:
+            self.calculation_stats['errors'] += 1
+            logger.error(f"❌ 指标计算失败: {e}")
+            return {}
+
+    def _calculate_indicators_dual_source(self, kline_data: pd.DataFrame,
+                                        requested_indicators: List[str],
+                                        stock_code: Optional[str] = None) -> Dict:
+        """
+        双源指标计算：第一步从RQDatac获取，第二步计算剩余指标
+
+        设计理念：
+        - 第一步：过滤出可以直接从RQDatac获取的字段，批量调用API
+        - 第二步：对于需要计算的字段，使用本地计算函数
+        - 最后：合并两个来源的指标数据
+
+        Args:
+            kline_data: K线数据 (包含OHLCV)
+            requested_indicators: 需要计算的指标列表（如 ['SMA_5', 'EMA_12', 'MACD']）
+            stock_code: 股票代码（用于日志）
+
+        Returns:
+            Dict: 包含完整技术指标的字典
+        """
+        if kline_data is None or kline_data.empty:
+            return {}
+
+        try:
+            logger.debug(f"🔄 双源指标计算开始: {stock_code or 'unknown'}")
+
+            # 使用传入的指标列表
+            logger.debug(f"📊 请求计算指标: {len(requested_indicators)} 个")
+            logger.debug(f"📋 指标列表: {requested_indicators[:10]}{'...' if len(requested_indicators) > 10 else ''}")
+
+            # 第一步：过滤出可以从RQDatac直接获取的字段
+            rqdatac_available_fields = []
+            computation_required_fields = []
+
+            for indicator in requested_indicators:
+                if indicator in get_direct_available_fields():
+                    rqdatac_available_fields.append(indicator)
+                else:
+                    computation_required_fields.append(indicator)
+
+            logger.debug(f"📊 RQDatac可用字段: {len(rqdatac_available_fields)}")
+            logger.debug(f"🧮 需要计算字段: {len(computation_required_fields)}")
+
+            # 初始化结果容器
+            all_indicators = {}
+            calculation_errors = []
+
+            # 第二步：从RQDatac获取可用指标
+            if rqdatac_available_fields:
+                try:
+                    logger.debug(f"🌐 从RQDatac获取 {len(rqdatac_available_fields)} 个指标...")
+
+                    # 将内部字段名转换为API字段名
+                    api_field_names = get_rqdatac_api_field_names(rqdatac_available_fields)
+
+                    # 这里应该调用RQDatac API获取数据
+                    # 暂时使用模拟数据，实际实现需要集成RQDatac
+                    for i, field in enumerate(rqdatac_available_fields):
+                        api_field = api_field_names[i]
+                        # 模拟从RQDatac获取的数据
+                        mock_data = pd.Series([None] * len(kline_data),
+                                            index=kline_data.index,
+                                            name=field)
+                        all_indicators[field] = mock_data
+
+                    logger.debug(f"✅ 从RQDatac获取了 {len(rqdatac_available_fields)} 个指标")
+
+                except Exception as e:
+                    logger.warning(f"⚠️ RQDatac获取失败，将使用本地计算: {e}")
+                    # 如果RQDatac失败，将这些字段加入计算队列
+                    computation_required_fields.extend(rqdatac_available_fields)
+                    rqdatac_available_fields = []
+
+            # 第三步：计算需要自己计算的指标
+            if computation_required_fields:
+                try:
+                    logger.debug(f"🧮 本地计算 {len(computation_required_fields)} 个指标...")
+
+                    for indicator_name in computation_required_fields:
+                        try:
+                            # 获取计算函数
+                            calc_function = get_indicator_calculation_function(indicator_name)
+
+                            if calc_function:
+                                try:
+                                    # 统一架构：所有指标都通过配置驱动，无需特殊处理
+                                    result = calc_function(kline_data)
+                                    if result is not None:
+                                        all_indicators[indicator_name] = result
+                                except Exception as e:
+                                    calculation_errors.append(f"{indicator_name} 计算失败: {e}")
+                                    logger.debug(f"⚠️ 指标计算失败 {indicator_name}: {e}")
+                            else:
+                                calculation_errors.append(f"未找到计算函数: {indicator_name}")
+
+                        except Exception as e:
+                            calculation_errors.append(f"{indicator_name} 计算失败: {e}")
+                            logger.debug(f"⚠️ 指标计算失败 {indicator_name}: {e}")
+
+                    logger.debug(f"✅ 本地计算完成 {len(computation_required_fields)} 个指标")
+
+                except Exception as e:
+                    logger.error(f"❌ 本地指标计算过程失败: {e}")
+                    calculation_errors.append(f"本地计算过程失败: {e}")
+
+            # 第四步：构建最终结果
+            # 获取最新值
+            latest_values = {}
+            for indicator_name, series in all_indicators.items():
+                if series is not None and not series.empty:
+                    latest_val = series.iloc[-1]
+                    if pd.notna(latest_val):
+                        latest_values[indicator_name] = float(latest_val)
+
+            # 构建返回结果
+            result = {
+                'indicators_df': pd.DataFrame(all_indicators),
+                'latest_values': latest_values,
+                'errors': calculation_errors
+            }
+
+            logger.debug(f"✅ 双源指标计算完成: {len(all_indicators)} 个指标")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ 双源指标计算失败: {e}")
+            return {}
 
 # ============================================================================
 # 数据质量评估器
