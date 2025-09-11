@@ -40,14 +40,28 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-logs/
-
+# Project specific
 # Data files - 程序生成的数据文件
-*.json.tmp
-*.pkl
-*.h5
+stockpool_data/
+data/
+*.json
+!config/*.json  # 但保留配置文件中的JSON
+
+# Logs and temp files
+logs/
+temp/
+backup/
+*.log
+*.tmp
+*.bak
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Test results
+test/reflection_reports/
+test/validation_results.json
 
 # Stock data - 股票数据文件（程序生成）
 stockpool_data/
