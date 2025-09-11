@@ -9,17 +9,19 @@
         "**/backup",
         "**/cache",
         "**/logs",
-        "**/*.pyc"
+        "**/*.pyc",
+        "**/.vscode"
     ],
     "pythonVersion": "3.13",
     "pythonPlatform": "Linux",
     "executionEnvironments": [
         {
             "root": ".",
-            "python": "/home/xiaqing/miniconda/bin/python3",
+            "python": "/home/xiaqing/miniconda/bin/python",
             "extraPaths": [
                 ".",
-                "./modules"
+                "./modules",
+                "/home/xiaqing/miniconda/lib/python3.13/site-packages"
             ]
         }
     ],
@@ -56,5 +58,8 @@
     "strictListInference": false,
     "strictDictionaryInference": false,
     "strictParameterNoneValue": false,
-    "strictSetInference": false
+    "strictSetInference": false,
+    "stubPath": "./typings",
+    "venvPath": "/home/xiaqing/miniconda",
+    "venv": "base"
 }
