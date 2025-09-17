@@ -7,6 +7,7 @@
         "**/.pytest_cache",
         "**/node_modules",
         "**/backup",
+        "**/.backups",
         "**/cache",
         "**/logs",
         "**/*.pyc",
